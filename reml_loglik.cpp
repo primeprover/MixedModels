@@ -327,3 +327,78 @@ Rcpp::List reml_loglik_cpp_impl(
   
   return result;
 }
+
+// [[Rcpp::export]]
+VectorXd compute_beta_hat_cpp(
+    const Eigen::VectorXd& theta,
+    Rcpp::XPtr<PreparedModel> model
+) {
+    using Eigen::MatrixXd;
+    using Eigen::VectorXd;
+
+    const int p = model->p;
+    const int q = model->q;
+    const int n_groups = model->groups.size();
+
+    // --- build G ---
+    MatrixXd L = build_cholesky_cpp(theta, q);
+    MatrixXd G = L * L.transpose();
+
+    double sigma = std::exp(theta(theta.size() - 1));
+    double sigma2 = sigma * sigma;
+
+    // jitter + inverse
+    MatrixXd G_jittered = G + 1e-8 * MatrixXd::Identity(q, q);
+    MatrixXd G_inv = G_jittered.inverse();
+
+    MatrixXd XtVinvX = MatrixXd::Zero(p, p);
+    VectorXd XtVinvy = VectorXd::Zero(p);
+
+    // precompute constants
+    double inv_sigma2 = 1.0 / sigma2;
+    double inv_sigma4 = inv_sigma2 * inv_sigma2;
+
+    for (int g = 0; g < n_groups; ++g) {
+
+        const auto& group = model->groups[g];
+
+        const MatrixXd& Xi = group.X;
+        const MatrixXd& Zi = group.Z;
+        const VectorXd& yi = group.y;
+
+        const MatrixXd& ZiZi = group.ZtZ;
+        const MatrixXd& Zix  = group.ZtX;
+        const VectorXd& Ziy  = group.ZtY;
+
+        // K = G^{-1} + Z'Z / sigma2
+        MatrixXd K = G_inv + ZiZi * inv_sigma2;
+
+        Eigen::LLT<MatrixXd> llt(K);
+
+        // ---- solve for BOTH RHS at once ----
+        MatrixXd RHS(q, p + 1);
+        RHS << Ziy, Zix;   // careful: adjust if dimensions differ
+
+        MatrixXd K_inv_RHS =
+            llt.solve(RHS);
+
+        VectorXd K_inv_Ziy = K_inv_RHS.col(0);
+        MatrixXd K_inv_Zix = K_inv_RHS.rightCols(p);
+
+        // V^{-1} y
+        VectorXd V_inv_y =
+            (yi * inv_sigma2) - (Zi * K_inv_Ziy) * inv_sigma4;
+
+        // V^{-1} X
+        MatrixXd V_inv_X =
+            (Xi * inv_sigma2) - (Zi * K_inv_Zix) * inv_sigma4;
+
+        XtVinvX.noalias() += Xi.transpose() * V_inv_X;
+        XtVinvy.noalias() += Xi.transpose() * V_inv_y;
+    }
+
+    // beta_hat
+    VectorXd beta_hat = XtVinvX.ldlt().solve(XtVinvy);
+
+    return beta_hat;
+}

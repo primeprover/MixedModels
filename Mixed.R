@@ -3,6 +3,7 @@
 ## ============================================================
 
 library(nlme)
+library(lme4)
 
 ## ============================================================
 ## Load compiled C++ engine (if available)
@@ -104,7 +105,7 @@ cat("Fitting reference lme model...\n")
 
 fit_lme <- lme(
   fixed = sbp ~ bmi + age,
-  random = ~ 0 + bmi + age | patient,
+  random = ~ 1 + bmi + age | patient,
   data = dat,
   method = "REML",
   control = lmeControl(
@@ -404,36 +405,44 @@ fit_mixed_simple <- function(formula, random, data,
 
   if (opt$convergence != 0) warning("Optimization did not converge")
 
+  # calc_bhat_time <- system.time({
+  #   th <- opt$par
+  #   L <- build_cholesky(th, prepared$q)
+  #   G_hat <- L %*% t(L)
+  #   sigma_hat <- exp(th[length(th)])
+
+  #   XtVinvX <- matrix(0, prepared$p, prepared$p)
+  #   XtVinvy <- numeric(prepared$p)
+  #   G_jittered <- G_hat + diag(1e-8, nrow(G_hat))
+  #   G_inv <- solve(G_jittered)
+  #   sigma2 <- sigma_hat^2
+
+  #   for (group in prepared$group_list) {
+  #     Xi <- group$X
+  #     Zi <- group$Z
+  #     yi <- group$y
+  #     ZiZi <- group$ZtZ
+  #     K <- G_inv + ZiZi / sigma2
+  #     cholK <- chol(K)
+  #     Ziy <- group$ZtY
+  #     K_inv_Ziy <- backsolve(cholK, forwardsolve(t(cholK), Ziy))
+  #     Vi_inv_y <- (yi / sigma2) - (Zi %*% K_inv_Ziy) / (sigma2^2)
+  #     Zix <- group$ZtX
+  #     K_inv_Zix <- backsolve(cholK, forwardsolve(t(cholK), Zix))
+  #     Vi_inv_X <- (Xi / sigma2) - (Zi %*% K_inv_Zix) / (sigma2^2)
+  #     XtVinvX <- XtVinvX + crossprod(Xi, Vi_inv_X)
+  #     XtVinvy <- XtVinvy + crossprod(Xi, Vi_inv_y)
+  #   }
+
+  #   beta_hat <- solve(XtVinvX, XtVinvy)
+  # })
+
   calc_bhat_time <- system.time({
     th <- opt$par
     L <- build_cholesky(th, prepared$q)
     G_hat <- L %*% t(L)
     sigma_hat <- exp(th[length(th)])
-
-    XtVinvX <- matrix(0, prepared$p, prepared$p)
-    XtVinvy <- numeric(prepared$p)
-    G_jittered <- G_hat + diag(1e-8, nrow(G_hat))
-    G_inv <- solve(G_jittered)
-    sigma2 <- sigma_hat^2
-
-    for (group in prepared$group_list) {
-      Xi <- group$X
-      Zi <- group$Z
-      yi <- group$y
-      ZiZi <- group$ZtZ
-      K <- G_inv + ZiZi / sigma2
-      cholK <- chol(K)
-      Ziy <- group$ZtY
-      K_inv_Ziy <- backsolve(cholK, forwardsolve(t(cholK), Ziy))
-      Vi_inv_y <- (yi / sigma2) - (Zi %*% K_inv_Ziy) / (sigma2^2)
-      Zix <- group$ZtX
-      K_inv_Zix <- backsolve(cholK, forwardsolve(t(cholK), Zix))
-      Vi_inv_X <- (Xi / sigma2) - (Zi %*% K_inv_Zix) / (sigma2^2)
-      XtVinvX <- XtVinvX + crossprod(Xi, Vi_inv_X)
-      XtVinvy <- XtVinvy + crossprod(Xi, Vi_inv_y)
-    }
-
-    beta_hat <- solve(XtVinvX, XtVinvy)
+    beta_hat <- compute_beta_hat_cpp(th, model)
   })
 
   ll_full <- reml_fun(opt$par, return_penalty = TRUE)
@@ -462,7 +471,7 @@ fit_mixed_simple <- function(formula, random, data,
 
 fit_new <- fit_mixed_simple(
   formula = sbp ~ bmi + age,
-  random  = ~ 0 + bmi + age | patient,
+  random  = ~ 1 + bmi + age | patient,
   data    = dat
 )
 
@@ -535,7 +544,7 @@ basic_test_fit_mixed_simple <- function(n_groups = 50, min_obs = 3, max_obs = 8,
   dat_loc <- data.frame(sbp = yloc, bmi = bmi_loc, age = age_loc, patient = factor(gid))
 
   res <- tryCatch(
-    fit_mixed_simple(sbp ~ bmi + age, ~ 0 + bmi + age | patient, dat_loc, maxit = 50, verbose = FALSE),
+    fit_mixed_simple(sbp ~ bmi + age, ~ 1 + bmi + age | patient, dat_loc, maxit = 50, verbose = FALSE),
     error = function(e) e
   )
 
@@ -590,7 +599,7 @@ time_cpp <- system.time({
   fit_cpp <- tryCatch(
     fit_mixed_simple(
       formula = sbp ~ bmi + age,
-      random  = ~ 0 + bmi + age | patient,
+      random  = ~ 1 + bmi + age | patient,
       data    = dat,
       engine  = "C++"
     ),
@@ -606,7 +615,16 @@ cat("\n--- Timing LME ---\n")
 time_lme <- system.time({
   fit_lme <- lme(
       sbp ~ bmi + age,
-      random  = ~ 0 + bmi + age | patient,
+      random  = ~ 1 + bmi + age | patient,
+      data    = dat
+    )
+})
+
+# Time with lmer
+cat("\n--- Timing LMER ---\n")
+time_lmer <- system.time({
+  fit_lmer <- lmer(
+      sbp ~ bmi + age + (1 + bmi + age | patient),
       data    = dat
     )
 })
@@ -620,34 +638,40 @@ if (!is.null(fit_cpp)) {
   cat("C++ engine FAILED\n")
 }
 
-# Compare results if both succeeded
-if (!is.null(fit_cpp)) {
-  # cat("\n--- ENGINE COMPARISON ---\n")
-  # cat("logLik difference (R - C++):", fit_r$logLik - fit_cpp$logLik, "\n")
-  # cat("Beta difference (max absolute):", max(abs(fit_r$beta - fit_cpp$beta)), "\n")
-  # cat("G matrix difference (max absolute):", max(abs(fit_r$G - fit_cpp$G)), "\n")
-  # cat("Sigma difference:", abs(fit_r$sigma - fit_cpp$sigma), "\n")
+cat("\n--- TIMING COMPARISON ---\n")
+cat("C++ engine:", round(time_cpp["elapsed"], 3), "sec\n")
+cat("LME:", round(time_lme["elapsed"], 3), "sec\n")
+cat("LMER:", round(time_lmer["elapsed"], 3), "sec\n")
 
-  cat("\n--- TIMING COMPARISON ---\n")
-  # cat("R engine:  ", round(time_r["elapsed"], 3), "sec\n")
-  cat("C++ engine:", round(time_cpp["elapsed"], 3), "sec\n")
-  # speedup <- time_r["elapsed"] / time_cpp["elapsed"]
-  # cat("Speedup (R / C++):", round(speedup, 2), "x\n")
-  cat("LME:", round(time_lme["elapsed"], 3), "sec\n")
-  
-  # Use realistic numerical tolerance (1e-4 for logLik, 1e-8 for parameters)
-  loglik_tol <- 1e-4
-  param_tol <- 1e-6
+# # Compare results if both succeeded
+# if (!is.null(fit_cpp)) {
+#   # cat("\n--- ENGINE COMPARISON ---\n")
+#   # cat("logLik difference (R - C++):", fit_r$logLik - fit_cpp$logLik, "\n")
+#   # cat("Beta difference (max absolute):", max(abs(fit_r$beta - fit_cpp$beta)), "\n")
+#   # cat("G matrix difference (max absolute):", max(abs(fit_r$G - fit_cpp$G)), "\n")
+#   # cat("Sigma difference:", abs(fit_r$sigma - fit_cpp$sigma), "\n")
 
-  # if (abs(fit_r$logLik - fit_cpp$logLik) < loglik_tol &&
-  #       max(abs(fit_r$beta - fit_cpp$beta)) < param_tol &&
-  #       max(abs(fit_r$G - fit_cpp$G)) < param_tol) {
-  #   cat("\n*** DUAL ENGINE VALIDATION: PASSED ***\n")
-  #   cat("Numerical differences within tolerance (logLik=", loglik_tol, ", params=", param_tol, ")\n")
-  # } else {
-  #   cat("\n*** DUAL ENGINE VALIDATION: DIFFERENCES TOO LARGE ***\n")
-  # }
-}
+#   cat("\n--- TIMING COMPARISON ---\n")
+#   # cat("R engine:  ", round(time_r["elapsed"], 3), "sec\n")
+#   cat("C++ engine:", round(time_cpp["elapsed"], 3), "sec\n")
+#   # speedup <- time_r["elapsed"] / time_cpp["elapsed"]
+#   # cat("Speedup (R / C++):", round(speedup, 2), "x\n")
+#   cat("LME:", round(time_lme["elapsed"], 3), "sec\n")
+#   cat("LMER:", round(time_lmer["elapsed"], 3), "sec\n")
+
+#   # Use realistic numerical tolerance (1e-4 for logLik, 1e-8 for parameters)
+#   loglik_tol <- 1e-4
+#   param_tol <- 1e-6
+
+#   # if (abs(fit_r$logLik - fit_cpp$logLik) < loglik_tol &&
+#   #       max(abs(fit_r$beta - fit_cpp$beta)) < param_tol &&
+#   #       max(abs(fit_r$G - fit_cpp$G)) < param_tol) {
+#   #   cat("\n*** DUAL ENGINE VALIDATION: PASSED ***\n")
+#   #   cat("Numerical differences within tolerance (logLik=", loglik_tol, ", params=", param_tol, ")\n")
+#   # } else {
+#   #   cat("\n*** DUAL ENGINE VALIDATION: DIFFERENCES TOO LARGE ***\n")
+#   # }
+# }
 print(fit_cpp$timings[4:9])
 
 th <- c(1, 2, 4, 8, 16)
@@ -659,7 +683,7 @@ for (t_idx in seq_along(th)) {
     fit_cpp <- tryCatch(
       fit_mixed_simple(
         formula = sbp ~ bmi + age,
-        random  = ~ 0 + bmi + age | patient,
+        random  = ~ 1 + bmi + age | patient,
         data    = dat,
         engine  = "C++"
       ),
@@ -672,5 +696,6 @@ for (t_idx in seq_along(th)) {
   cat("Threads:", t, "Elapsed time:", round(time_cpp["elapsed"], 3), "sec\n")
   times[t_idx] <- time_cpp["elapsed"]
 }
-cbind(th, times)
+print(cbind(th, times))
+
 
