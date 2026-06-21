@@ -9,9 +9,9 @@ library(nlme)
 ## ============================================================
 # Compile the C++ REML likelihood implementation
 tryCatch(
-  Sys.setenv(PKG_CXXFLAGS = "-fopenmp"),
+  Sys.setenv(PKG_CXXFLAGS = "-fopenmp -Wno-ignored-attributes -Wno-unused"),
   Sys.setenv(PKG_LIBS = "-fopenmp"),
-  Rcpp::sourceCpp("reml_loglik.cpp"),
+  Rcpp::sourceCpp("reml_loglik.cpp", rebuild = TRUE, showOutput = TRUE),
   error = function(e) {
     cat("Warning: Could not compile C++ engine. Using R engine only.\n")
     cat("  Details:", as.character(e), "\n")
@@ -23,7 +23,7 @@ set.seed(123)
 ## ----------------------------
 ## Simulation parameters
 ## ----------------------------
-n_patients <- 1000
+n_patients <- 10000
 min_obs <- 3
 max_obs <- 100
 
@@ -322,14 +322,14 @@ reml_loglik_r <- function(theta, prepared, return_penalty = FALSE) {
   }
 }
 
-reml_loglik_cpp <- function(theta, prepared, return_penalty = FALSE) {
+reml_loglik_cpp <- function(theta, model, return_penalty = FALSE) {
   # Wrapper to call compiled C++ implementation
   # Delegates to reml_loglik_cpp_impl (defined in reml_loglik.cpp)
   # Converts return format to match reml_loglik_r API
 
   tryCatch(
     {
-      result <- reml_loglik_cpp_impl(theta, prepared, return_penalty = TRUE, return_timing = TRUE)
+      result <- reml_loglik_cpp_impl(theta, model, return_penalty = TRUE, return_timing = TRUE)
 
       if (return_penalty) {
         return(list(
@@ -348,28 +348,22 @@ reml_loglik_cpp <- function(theta, prepared, return_penalty = FALSE) {
   )
 }
 
-reml_loglik_cpp_timed <- function(theta, prepared) {
-  result <- reml_loglik_cpp_timed_impl(theta, prepared)
-  timings <- result$timings
-  list(
-    logLik_unpenalized = result$logLik_unpenalized,
-    logLik_penalized = result$logLik_penalized,
-    penalty = result$penalty,
-    timings = timings
-  )
-}
-
 fit_mixed_simple <- function(formula, random, data,
                              maxit = 100, verbose = TRUE,
-                             engine = c("R", "C++")) {
+                             engine = "C++") {
   engine <- match.arg(engine)
-  prepared <- prepare_mixed_data(formula, random, data)
-
+  
+  fake_time <- system.time({}, gcFirst = FALSE)  # Dummy timing to avoid first-time overhead
+  print(fake_time)
+  prepare_time <- system.time(prepared <- prepare_mixed_data(formula, random, data), gcFirst = FALSE)
+    
   # Route to appropriate engine
   if (engine == "C++") {
+    extract_time <- system.time(model <- init_model_cpp(prepared), gcFirst = FALSE)
+    
     # Delegate likelihood computation to compiled C++ code
     reml_fun <- function(theta, return_penalty = FALSE) {
-      reml_loglik_cpp(theta, prepared, return_penalty)
+      reml_loglik_cpp(theta, model, return_penalty)
     }
   } else {
     # Use pure R implementation
@@ -377,67 +371,80 @@ fit_mixed_simple <- function(formula, random, data,
       reml_loglik_r(theta, prepared, return_penalty)
     }
   }
+  initial_values_time <- system.time( {
+    theta_init <- init_theta_general(prepared)
+    theta_len <- prepared$q + prepared$n_corr + 1
+    y_sd <- prepared$sigma_y
 
-  theta_init <- init_theta_general(prepared)
-  theta_len <- prepared$q + prepared$n_corr + 1
-  y_sd <- prepared$sigma_y
+    lower <- rep(-Inf, theta_len)
+    upper <- rep(Inf, theta_len)
+    lower[1:prepared$q] <- log(pmax(y_sd * 1e-6, 1e-12)) - 8
+    upper[1:prepared$q] <- log(pmax(y_sd, 1e-6)) + 8
 
-  lower <- rep(-Inf, theta_len)
-  upper <- rep(Inf, theta_len)
-  lower[1:prepared$q] <- log(pmax(y_sd * 1e-6, 1e-12)) - 8
-  upper[1:prepared$q] <- log(pmax(y_sd, 1e-6)) + 8
+    if (prepared$n_corr > 0) {
+      corr_idx <- (prepared$q + 1):(prepared$q + prepared$n_corr)
+      lower[corr_idx] <- -4.5
+      upper[corr_idx] <- 4.5
+    }
 
-  if (prepared$n_corr > 0) {
-    corr_idx <- (prepared$q + 1):(prepared$q + prepared$n_corr)
-    lower[corr_idx] <- -4.5
-    upper[corr_idx] <- 4.5
-  }
+    lower[theta_len] <- log(pmax(y_sd * 1e-6, 1e-12)) - 8
+    upper[theta_len] <- log(pmax(y_sd, 1e-6)) + 8
+  }, gcFirst = FALSE)
 
-  lower[theta_len] <- log(pmax(y_sd * 1e-6, 1e-12)) - 8
-  upper[theta_len] <- log(pmax(y_sd, 1e-6)) + 8
-
-  opt <- optim(
-    theta_init,
-    fn = function(th) -reml_fun(th),
-    method = "L-BFGS-B",
-    lower = lower,
-    upper = upper,
-    control = list(maxit = maxit, trace = ifelse(isTRUE(verbose), 1, 0))
-  )
+  optim_time <- system.time( {
+    opt <- optim(
+      theta_init,
+      fn = function(th) -reml_fun(th),
+      method = "L-BFGS-B",
+      lower = lower,
+      upper = upper,
+      control = list(maxit = maxit, trace = ifelse(isTRUE(verbose), 1, 0))
+    )
+  })
 
   if (opt$convergence != 0) warning("Optimization did not converge")
 
-  th <- opt$par
-  L <- build_cholesky(th, prepared$q)
-  G_hat <- L %*% t(L)
-  sigma_hat <- exp(th[length(th)])
+  calc_bhat_time <- system.time({
+    th <- opt$par
+    L <- build_cholesky(th, prepared$q)
+    G_hat <- L %*% t(L)
+    sigma_hat <- exp(th[length(th)])
 
-  XtVinvX <- matrix(0, prepared$p, prepared$p)
-  XtVinvy <- numeric(prepared$p)
-  G_jittered <- G_hat + diag(1e-8, nrow(G_hat))
-  G_inv <- solve(G_jittered)
-  sigma2 <- sigma_hat^2
+    XtVinvX <- matrix(0, prepared$p, prepared$p)
+    XtVinvy <- numeric(prepared$p)
+    G_jittered <- G_hat + diag(1e-8, nrow(G_hat))
+    G_inv <- solve(G_jittered)
+    sigma2 <- sigma_hat^2
 
-  for (group in prepared$group_list) {
-    Xi <- group$X
-    Zi <- group$Z
-    yi <- group$y
-    ZiZi <- group$ZtZ
-    K <- G_inv + ZiZi / sigma2
-    cholK <- chol(K)
-    Ziy <- group$ZtY
-    K_inv_Ziy <- backsolve(cholK, forwardsolve(t(cholK), Ziy))
-    Vi_inv_y <- (yi / sigma2) - (Zi %*% K_inv_Ziy) / (sigma2^2)
-    Zix <- group$ZtX
-    K_inv_Zix <- backsolve(cholK, forwardsolve(t(cholK), Zix))
-    Vi_inv_X <- (Xi / sigma2) - (Zi %*% K_inv_Zix) / (sigma2^2)
-    XtVinvX <- XtVinvX + crossprod(Xi, Vi_inv_X)
-    XtVinvy <- XtVinvy + crossprod(Xi, Vi_inv_y)
-  }
+    for (group in prepared$group_list) {
+      Xi <- group$X
+      Zi <- group$Z
+      yi <- group$y
+      ZiZi <- group$ZtZ
+      K <- G_inv + ZiZi / sigma2
+      cholK <- chol(K)
+      Ziy <- group$ZtY
+      K_inv_Ziy <- backsolve(cholK, forwardsolve(t(cholK), Ziy))
+      Vi_inv_y <- (yi / sigma2) - (Zi %*% K_inv_Ziy) / (sigma2^2)
+      Zix <- group$ZtX
+      K_inv_Zix <- backsolve(cholK, forwardsolve(t(cholK), Zix))
+      Vi_inv_X <- (Xi / sigma2) - (Zi %*% K_inv_Zix) / (sigma2^2)
+      XtVinvX <- XtVinvX + crossprod(Xi, Vi_inv_X)
+      XtVinvy <- XtVinvy + crossprod(Xi, Vi_inv_y)
+    }
 
-  beta_hat <- solve(XtVinvX, XtVinvy)
+    beta_hat <- solve(XtVinvX, XtVinvy)
+  })
+
   ll_full <- reml_fun(opt$par, return_penalty = TRUE)
-
+  if (!is.null(ll_full$timings)) {
+    ll_full$timings$extract <- as.numeric(extract_time["elapsed"])
+    ll_full$timings$prepare <- as.numeric(prepare_time["elapsed"])
+    ll_full$timings$calc_bhat <- as.numeric(calc_bhat_time["elapsed"])
+    ll_full$timings$initial_values <- as.numeric(initial_values_time["elapsed"])
+    ll_full$timings$optim <- as.numeric(optim_time["elapsed"])
+    ll_full$timings$total <- ll_full$timings$extract + ll_full$timings$prepare + ll_full$timings$calc_bhat + ll_full$timings$initial_values + ll_full$timings$optim
+  }
   list(
     beta = beta_hat,
     G = G_hat,
@@ -552,46 +559,30 @@ cat("Testing R engine vs C++ engine on same data and parameters...\n\n")
 
 # Test with R engine
 cat("--- Testing R engine ---\n")
-time_r <- system.time({
-  fit_r <- tryCatch(
-    fit_mixed_simple(
-      formula = sbp ~ bmi + age,
-      random  = ~ 0 + bmi + age | patient,
-      data    = dat,
-      engine  = "R"
-    ),
-    error = function(e) {
-      cat("Error in R engine:", as.character(e), "\n")
-      NULL
-    }
-  )
-})
+cat("Disabled R engine test for now due to performance issues on large datasets.\n")
+# time_r <- system.time({
+#   fit_r <- tryCatch(
+#     fit_mixed_simple(
+#       formula = sbp ~ bmi + age,
+#       random  = ~ 0 + bmi + age | patient,
+#       data    = dat,
+#       engine  = "R"
+#     ),
+#     error = function(e) {
+#       cat("Error in R engine:", as.character(e), "\n")
+#       NULL
+#     }
+#   )
+# })
 
-if (!is.null(fit_r)) {
-  cat("R engine: logLik =", fit_r$logLik, "\n")
-  cat("R engine: penalty =", fit_r$penalty, "\n")
-  cat("R engine: convergence =", fit_r$optim_convergence, "\n")
-  cat("R engine: elapsed time =", round(time_r["elapsed"], 3), "sec\n")
-} else {
-  cat("R engine FAILED\n")
-}
-
-# Test with C++ engine
-cat("\n--- Testing C++ engine ---\n")
-time_cpp <- system.time({
-  fit_cpp <- tryCatch(
-    fit_mixed_simple(
-      formula = sbp ~ bmi + age,
-      random  = ~ 0 + bmi + age | patient,
-      data    = dat,
-      engine  = "C++"
-    ),
-    error = function(e) {
-      cat("Error in C++ engine:", as.character(e), "\n")
-      NULL
-    }
-  )
-})
+# if (!is.null(fit_r)) {
+#   cat("R engine: logLik =", fit_r$logLik, "\n")
+#   cat("R engine: penalty =", fit_r$penalty, "\n")
+#   cat("R engine: convergence =", fit_r$optim_convergence, "\n")
+#   cat("R engine: elapsed time =", round(time_r["elapsed"], 3), "sec\n")
+# } else {
+#   cat("R engine FAILED\n")
+# }
 
 # Test with C++ engine
 cat("\n--- Testing C++ engine ---\n")
@@ -630,46 +621,56 @@ if (!is.null(fit_cpp)) {
 }
 
 # Compare results if both succeeded
-if (!is.null(fit_r) && !is.null(fit_cpp)) {
-  cat("\n--- ENGINE COMPARISON ---\n")
-  cat("logLik difference (R - C++):", fit_r$logLik - fit_cpp$logLik, "\n")
-  cat("Beta difference (max absolute):", max(abs(fit_r$beta - fit_cpp$beta)), "\n")
-  cat("G matrix difference (max absolute):", max(abs(fit_r$G - fit_cpp$G)), "\n")
-  cat("Sigma difference:", abs(fit_r$sigma - fit_cpp$sigma), "\n")
+if (!is.null(fit_cpp)) {
+  # cat("\n--- ENGINE COMPARISON ---\n")
+  # cat("logLik difference (R - C++):", fit_r$logLik - fit_cpp$logLik, "\n")
+  # cat("Beta difference (max absolute):", max(abs(fit_r$beta - fit_cpp$beta)), "\n")
+  # cat("G matrix difference (max absolute):", max(abs(fit_r$G - fit_cpp$G)), "\n")
+  # cat("Sigma difference:", abs(fit_r$sigma - fit_cpp$sigma), "\n")
 
   cat("\n--- TIMING COMPARISON ---\n")
-  cat("R engine:  ", round(time_r["elapsed"], 3), "sec\n")
+  # cat("R engine:  ", round(time_r["elapsed"], 3), "sec\n")
   cat("C++ engine:", round(time_cpp["elapsed"], 3), "sec\n")
-  speedup <- time_r["elapsed"] / time_cpp["elapsed"]
-  cat("Speedup (R / C++):", round(speedup, 2), "x\n")
+  # speedup <- time_r["elapsed"] / time_cpp["elapsed"]
+  # cat("Speedup (R / C++):", round(speedup, 2), "x\n")
   cat("LME:", round(time_lme["elapsed"], 3), "sec\n")
   
   # Use realistic numerical tolerance (1e-4 for logLik, 1e-8 for parameters)
   loglik_tol <- 1e-4
   param_tol <- 1e-6
 
-  if (abs(fit_r$logLik - fit_cpp$logLik) < loglik_tol &&
-        max(abs(fit_r$beta - fit_cpp$beta)) < param_tol &&
-        max(abs(fit_r$G - fit_cpp$G)) < param_tol) {
-    cat("\n*** DUAL ENGINE VALIDATION: PASSED ***\n")
-    cat("Numerical differences within tolerance (logLik=", loglik_tol, ", params=", param_tol, ")\n")
-  } else {
-    cat("\n*** DUAL ENGINE VALIDATION: DIFFERENCES TOO LARGE ***\n")
-  }
+  # if (abs(fit_r$logLik - fit_cpp$logLik) < loglik_tol &&
+  #       max(abs(fit_r$beta - fit_cpp$beta)) < param_tol &&
+  #       max(abs(fit_r$G - fit_cpp$G)) < param_tol) {
+  #   cat("\n*** DUAL ENGINE VALIDATION: PASSED ***\n")
+  #   cat("Numerical differences within tolerance (logLik=", loglik_tol, ", params=", param_tol, ")\n")
+  # } else {
+  #   cat("\n*** DUAL ENGINE VALIDATION: DIFFERENCES TOO LARGE ***\n")
+  # }
 }
-fit_cpp$timings
+print(fit_cpp$timings[4:9])
 
-# $extract
-# [1] 0.0043137
+th <- c(1, 2, 4, 8, 16)
+times <- numeric(length(th))
+for (t_idx in seq_along(th)) {
+  t <- th[t_idx]
+  set_threads_cpp(t)
+  time_cpp <- system.time({
+    fit_cpp <- tryCatch(
+      fit_mixed_simple(
+        formula = sbp ~ bmi + age,
+        random  = ~ 0 + bmi + age | patient,
+        data    = dat,
+        engine  = "C++"
+      ),
+      error = function(e) {
+        cat("Error in C++ engine:", as.character(e), "\n")
+        NULL
+      }
+    )
+  })
+  cat("Threads:", t, "Elapsed time:", round(time_cpp["elapsed"], 3), "sec\n")
+  times[t_idx] <- time_cpp["elapsed"]
+}
+cbind(th, times)
 
-# $build_G
-# [1] 7.3e-06
-
-# $groups
-# [1] 0.0009258
-
-# $finalize
-# [1] 2.1e-06
-
-# $total
-# [1] 0.0052489

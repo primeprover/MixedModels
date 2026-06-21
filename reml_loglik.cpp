@@ -22,8 +22,16 @@ using namespace Eigen;
 // Helper structures and functions
 // ============================================================
 
+// [[Rcpp::export]]
+void set_threads_cpp(int n_threads) {
+#ifdef _OPENMP
+    omp_set_num_threads(n_threads);
+#endif
+}
+
 // Group data structure: precomputed matrices for a single group
 struct GroupData {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   MatrixXd X;      // design matrix for fixed effects
   MatrixXd Z;      // design matrix for random effects
   VectorXd y;      // response vector
@@ -31,6 +39,23 @@ struct GroupData {
   MatrixXd ZtZ;    // Z'Z (precomputed)
   VectorXd ZtY;    // Z'y (precomputed)
   MatrixXd ZtX;    // Z'X (precomputed)
+};
+
+struct PreparedModel {
+
+  // static scalar parameters
+  int p;
+  int q;
+  int n_corr;
+
+  double lo_sigma;
+  double hi_sigma;
+
+  // static data
+  VectorXd y;
+
+  // grouped structure
+  std::vector<GroupData> groups;
 };
 
 // Extract group data from R list
@@ -54,6 +79,24 @@ std::vector<GroupData> extract_groups(const Rcpp::List& prepared) {
   }
 
   return groups;
+}
+
+// [[Rcpp::export]]
+Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
+
+  auto model = new PreparedModel();
+
+  model->p        = prepared["p"];
+  model->q        = prepared["q"];
+  model->n_corr   = prepared["n_corr"];
+  model->lo_sigma = prepared["lo_sigma"];
+  model->hi_sigma = prepared["hi_sigma"];
+
+  model->y = Rcpp::as<VectorXd>(prepared["y"]);
+
+  model->groups = extract_groups(prepared);
+
+  return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
 // Build Cholesky factor L from unconstrained parameters
@@ -100,29 +143,24 @@ MatrixXd build_cholesky_cpp(const VectorXd& theta, int q) {
 
 // [[Rcpp::export]]
 Rcpp::List reml_loglik_cpp_impl(
-    const Rcpp::NumericVector& theta_r,
-    const Rcpp::List& prepared,
+    const Eigen::VectorXd& theta,
+    Rcpp::XPtr<PreparedModel> model,
     bool return_penalty,
-    bool return_timing = false
+    bool return_timing
 ) {
   // Convert theta to Eigen vector
   auto t_start = std::chrono::high_resolution_clock::now();
-  VectorXd theta = Rcpp::as<VectorXd>(theta_r);
+  //const VectorXd& theta = theta_r;
+  const auto& groups = model->groups;
+  const VectorXd& y = model->y;
+  int p = model->p;
+  int q = model->q;
+  int n_corr = model->n_corr;
+  double lo_sigma = model->lo_sigma;
+  double hi_sigma = model->hi_sigma;
   
-  // Extract parameters from prepared list
-  int p = prepared["p"];
-  int q = prepared["q"];
-  int n_corr = prepared["n_corr"];
-  double lo_sigma = prepared["lo_sigma"];
-  double hi_sigma = prepared["hi_sigma"];
-  VectorXd y = Rcpp::as<VectorXd>(prepared["y"]);
-  
-  // Extract group data
-  std::vector<GroupData> groups = extract_groups(prepared);
   int n_groups = groups.size();
-  auto t_after_extract = std::chrono::high_resolution_clock::now();
-  double t_extract = std::chrono::duration<double>(t_after_extract - t_start).count();
-  
+
   // Helper lambda for bad result
   auto bad_result = [&]() {
     Rcpp::List result;
@@ -131,7 +169,6 @@ Rcpp::List reml_loglik_cpp_impl(
     result["penalty"] = NA_REAL;
     if (return_timing && return_penalty) {
       result["timings"] = Rcpp::List::create(
-        Rcpp::Named("extract") = t_extract,
         Rcpp::Named("build_G") = 0.0,
         Rcpp::Named("groups") = 0.0,
         Rcpp::Named("finalize") = 0.0
@@ -177,7 +214,7 @@ Rcpp::List reml_loglik_cpp_impl(
   }
   penalty *= 1e-6;
   auto t_after_build = std::chrono::high_resolution_clock::now();
-  double t_build = std::chrono::duration<double>(t_after_build - t_after_extract).count();
+  double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
   
   // Accumulate sufficient statistics across groups
   MatrixXd XtVinvX = MatrixXd::Zero(p, p);
@@ -201,6 +238,7 @@ Rcpp::List reml_loglik_cpp_impl(
   std::vector<double> quad_loc(n_threads, 0.0);
 
   auto t_loop_start = std::chrono::high_resolution_clock::now();
+  //std::cout << "Build to groups time: " << std::chrono::duration<double>(t_loop_start - t_after_build).count() << " seconds" << std::endl;
 #ifdef _OPENMP
   #pragma omp parallel for
 #endif
@@ -280,28 +318,12 @@ Rcpp::List reml_loglik_cpp_impl(
   result["penalty"] = penalty;
   if (return_timing && return_penalty) {
     result["timings"] = Rcpp::List::create(
-      Rcpp::Named("extract") = t_extract,
       Rcpp::Named("build_G") = t_build,
       Rcpp::Named("groups") = t_groups,
       Rcpp::Named("finalize") = t_finalize,
-      Rcpp::Named("total") = t_extract + t_build + t_groups + t_finalize
+      Rcpp::Named("total") = 0 + t_build + t_groups + t_finalize
     );
   }
   
   return result;
 }
-
-// [[Rcpp::export]]
-Rcpp::List reml_loglik_cpp_timed_impl(
-    const Rcpp::NumericVector& theta_r,
-    const Rcpp::List& prepared
-) {
-  return reml_loglik_cpp_impl(theta_r, prepared, true, true);
-}
-
-// ============================================================
-// Placeholder note:
-// This file will be compiled via Rcpp::sourceCpp() from Mixed.R
-// Once implemented, reml_loglik_cpp_impl will handle all REML 
-// likelihood computation in C++, enabling ~2-10x speedup over R.
-// ============================================================
