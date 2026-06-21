@@ -1,0 +1,8 @@
+{
+  "r.linting.enabled": true,
+  "r.lsp.diagnostics": true,
+  "r.linting.linters": {
+    "lintr": true
+  },
+  "C_Cpp.dimInactiveRegions": false
+}
