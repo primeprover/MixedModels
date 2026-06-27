@@ -180,6 +180,7 @@ bool accumulate_groups(
   double& quad
 ) {
   int n_threads = 1;
+  Eigen::setNbThreads(1);
 #ifdef _OPENMP
   #pragma omp parallel
   {
@@ -197,47 +198,82 @@ bool accumulate_groups(
   std::vector<double> quad_loc(n_threads, 0.0);
   std::atomic<bool> bad(false);
 
-#ifdef _OPENMP
-// TODO: tune further
-  #pragma omp parallel for schedule(guided)
-//  #pragma omp parallel for
-#endif
-  for (int ig = 0; ig < (int)groups.size(); ++ig) {
-    if (bad.load(std::memory_order_relaxed)) continue;
-    const auto& group = groups[ig];
+  const double inv_sigma2    = 1.0 / sigma2;
+  const double inv_sigma2_sq = inv_sigma2 * inv_sigma2;
 
-    // Compute K = G_inv + Z_i' Z_i / sigma^2
-    MatrixXd K = G_inv + group.ZtZ / sigma2;
+  const int p = XtVinvX.rows();
 
-    // Cholesky decompose K for efficient solve and log-det
-    Eigen::LLT<MatrixXd> llt_K(K);
-    if (llt_K.info() != Eigen::Success) {
-      bad.store(true, std::memory_order_relaxed);
-      continue;
-    }
+  #ifdef _OPENMP
+  #pragma omp parallel
+  #endif
+  {
+      const int tid =
+  #ifdef _OPENMP
+          omp_get_thread_num();
+  #else
+          0;
+  #endif
 
-    // Log-determinant of K from Cholesky factor
-    double logdetK = 2.0 * llt_K.matrixLLT().diagonal().array().log().sum();
-    double t_logdetV = group.n * std::log(sigma2) + logdetK;
+      MatrixXd K = G_inv;
+      MatrixXd K_inv_Zix;
+      VectorXd K_inv_Ziy;
+      MatrixXd Vi_inv_X;
+      VectorXd Vi_inv_y;
 
-    // Solve K^{-1} Z_i' y and K^{-1} Z_i' X
-    VectorXd K_inv_Ziy = llt_K.solve(group.ZtY);
-    MatrixXd K_inv_Zix = llt_K.solve(group.ZtX);
+      MatrixXd XtVinvX_local = MatrixXd::Zero(p, p);
+      VectorXd XtVinvy_local = VectorXd::Zero(p);
+      double   logdetV_local = 0.0;
+      double   quad_local    = 0.0;
 
-    // Compute Vi_inv_y and Vi_inv_X (using Woodbury identity implicitly)
-    VectorXd Vi_inv_y = group.y / sigma2 - group.Z * K_inv_Ziy / (sigma2 * sigma2);
-    MatrixXd Vi_inv_X = group.X / sigma2 - group.Z * K_inv_Zix / (sigma2 * sigma2);
+      Eigen::LLT<MatrixXd, Eigen::Lower> llt;
 
-    int tid = 0;
-#ifdef _OPENMP
-    tid = omp_get_thread_num();
-#endif
+  #ifdef _OPENMP
+  #pragma omp for schedule(guided)
+  #endif
+      for (int ig = 0; ig < (int)groups.size(); ++ig) {
+          if (bad.load(std::memory_order_relaxed)) continue;
 
-    XtVinvX_loc[tid] += group.X.transpose() * Vi_inv_X;
-    XtVinvy_loc[tid] += group.X.transpose() * Vi_inv_y;
-    logdetV_loc[tid] += t_logdetV;
-    quad_loc[tid] += group.y.transpose() * Vi_inv_y;
+          const auto& group = groups[ig];
+
+          K.noalias() = G_inv;
+          K.noalias() += group.ZtZ * inv_sigma2;
+
+          llt.compute(K);
+          if (llt.info() != Eigen::Success) {
+              bad.store(true, std::memory_order_relaxed);
+              continue;
+          }
+
+          const auto& L = llt.matrixLLT();
+          const double logdetK   = 2.0 * L.diagonal().array().log().sum();
+          const double t_logdetV = group.n * std::log(sigma2) + logdetK;
+
+          K_inv_Ziy = llt.solve(group.ZtY);
+          K_inv_Zix = llt.solve(group.ZtX);
+
+          Vi_inv_y = group.y * inv_sigma2;
+          Vi_inv_y.noalias() -= group.Z * K_inv_Ziy * inv_sigma2_sq;
+
+          Vi_inv_X = group.X * inv_sigma2;
+          Vi_inv_X.noalias() -= group.Z * K_inv_Zix * inv_sigma2_sq;
+
+          XtVinvX_local.noalias() += group.X.transpose() * Vi_inv_X;
+          XtVinvy_local.noalias() += group.X.transpose() * Vi_inv_y;
+          logdetV_local += t_logdetV;
+          quad_local    += group.y.dot(Vi_inv_y);
+      }
+
+  #ifdef _OPENMP
+  #pragma omp critical
+  #endif
+      {
+          XtVinvX += XtVinvX_local;
+          XtVinvy += XtVinvy_local;
+          logdetV += logdetV_local;
+          quad    += quad_local;
+      }
   }
+
 
   if (bad.load(std::memory_order_relaxed)) return false;
 
