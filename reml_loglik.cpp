@@ -83,7 +83,6 @@ std::vector<GroupData> extract_groups(const Rcpp::List& prepared) {
 
 // [[Rcpp::export]]
 Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
-
   auto model = new PreparedModel();
 
   model->p        = prepared["p"];
@@ -95,7 +94,7 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   model->y = Rcpp::as<VectorXd>(prepared["y"]);
 
   model->groups = extract_groups(prepared);
-
+  
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
@@ -137,96 +136,49 @@ MatrixXd build_cholesky_cpp(const VectorXd& theta, int q) {
   return L_corr;
 }
 
-// ============================================================
-// Main REML log-likelihood computation
-// ============================================================
-
-// [[Rcpp::export]]
-Rcpp::List reml_loglik_cpp_impl(
-    const Eigen::VectorXd& theta,
-    Rcpp::XPtr<PreparedModel> model,
-    bool return_penalty,
-    bool return_timing
-) {
-  // Convert theta to Eigen vector
-  auto t_start = std::chrono::high_resolution_clock::now();
-  //const VectorXd& theta = theta_r;
-  const auto& groups = model->groups;
-  const VectorXd& y = model->y;
-  int p = model->p;
-  int q = model->q;
-  int n_corr = model->n_corr;
-  double lo_sigma = model->lo_sigma;
-  double hi_sigma = model->hi_sigma;
-  
-  int n_groups = groups.size();
-
-  // Helper lambda for bad result
-  auto bad_result = [&]() {
+inline Rcpp::List bad_result()
+{
     Rcpp::List result;
     result["logLik_unpenalized"] = -1e20;
     result["logLik_penalized"] = -1e20;
     result["penalty"] = NA_REAL;
-    if (return_timing && return_penalty) {
-      result["timings"] = Rcpp::List::create(
+    // TODO: add newer timings
+    result["timings"] = Rcpp::List::create(
         Rcpp::Named("build_G") = 0.0,
         Rcpp::Named("groups") = 0.0,
         Rcpp::Named("finalize") = 0.0
-      );
-    }
+    );
     return result;
-  };
-  
-  // Extract parameters from theta
-  VectorXd log_sds = theta.head(q);
-  VectorXd corrs_unconstrained = theta.segment(q, n_corr);
-  double log_sigma_resid = theta(q + n_corr);
-  
-  // Parameter validation
-  VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
-  if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
-  if (log_sigma_resid < std::log(std::numeric_limits<double>::epsilon())) return bad_result();
-  
-  // Build Cholesky factor L and compute G = L L'
-  MatrixXd L = build_cholesky_cpp(theta, q);
-  MatrixXd G = L * L.transpose();
-  
-  // Add jitter for numerical stability
-  G.diagonal().array() += 1e-8;
-  
-  // Compute G_inv using Eigen's LLT Cholesky solver (more stable than direct inversion)
-  Eigen::LLT<MatrixXd> llt_G(G);
-  if (llt_G.info() != Eigen::Success) return bad_result();
-  MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(q, q));
-  
-  // Compute log-determinant of G from Cholesky factor
-  double logdetG = 2.0 * llt_G.matrixLLT().diagonal().array().log().sum();
-  
-  double sigma = std::exp(log_sigma_resid);
-  double sigma2 = sigma * sigma;
-  
+}
+
+double compute_penalty(
+  const PreparedModel& model,  
+  const VectorXd& log_sds
+    ) {
+
   // Compute penalty on log-SDs
   double penalty = 0.0;
-  for (int i = 0; i < q; ++i) {
-    double excess_hi = std::max(0.0, log_sds(i) - hi_sigma);
-    double excess_lo = std::max(0.0, lo_sigma - log_sds(i));
+  for (int i = 0; i < model.q; ++i) {
+    double excess_hi = std::max(0.0, log_sds(i) - model.hi_sigma);
+    double excess_lo = std::max(0.0, model.lo_sigma - log_sds(i));
     penalty += excess_hi * excess_hi + excess_lo * excess_lo;
     penalty += log_sds(i) * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   }
   penalty *= 1e-6;
   //std::cout << "Penalty: " << penalty << " Lo_sigma: " << lo_sigma << " Hi_sigma: " << hi_sigma << std::endl;
-  
-  
-  auto t_after_build = std::chrono::high_resolution_clock::now();
-  double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
-  
-  // Accumulate sufficient statistics across groups
-  MatrixXd XtVinvX = MatrixXd::Zero(p, p);
-  VectorXd XtVinvy = VectorXd::Zero(p);
-  double logdetV = 0.0;
-  double quad = 0.0;
-  std::atomic<bool> bad(false);
+  return penalty;
+}
 
+//__attribute__((noinline))
+bool accumulate_groups(
+  const PreparedModel& model,
+  const MatrixXd& G_inv,
+  const double& sigma2,
+  MatrixXd& XtVinvX,
+  VectorXd& XtVinvy,
+  double& logdetV,
+  double& quad
+) {
   int n_threads = 1;
 #ifdef _OPENMP
   #pragma omp parallel
@@ -236,17 +188,21 @@ Rcpp::List reml_loglik_cpp_impl(
   }
 #endif
 
-  std::vector<MatrixXd> XtVinvX_loc(n_threads, MatrixXd::Zero(p, p));
-  std::vector<VectorXd> XtVinvy_loc(n_threads, VectorXd::Zero(p));
+  const auto& groups = model.groups;
+  const VectorXd& y = model.y;
+
+  std::vector<MatrixXd> XtVinvX_loc(n_threads, MatrixXd::Zero(model.p, model.p));
+  std::vector<VectorXd> XtVinvy_loc(n_threads, VectorXd::Zero(model.p));
   std::vector<double> logdetV_loc(n_threads, 0.0);
   std::vector<double> quad_loc(n_threads, 0.0);
+  std::atomic<bool> bad(false);
 
-  auto t_loop_start = std::chrono::high_resolution_clock::now();
-  //std::cout << "Build to groups time: " << std::chrono::duration<double>(t_loop_start - t_after_build).count() << " seconds" << std::endl;
 #ifdef _OPENMP
-  #pragma omp parallel for
+// TODO: tune further
+  #pragma omp parallel for schedule(guided)
+//  #pragma omp parallel for
 #endif
-  for (int ig = 0; ig < n_groups; ++ig) {
+  for (int ig = 0; ig < (int)groups.size(); ++ig) {
     if (bad.load(std::memory_order_relaxed)) continue;
     const auto& group = groups[ig];
 
@@ -283,7 +239,7 @@ Rcpp::List reml_loglik_cpp_impl(
     quad_loc[tid] += group.y.transpose() * Vi_inv_y;
   }
 
-  if (bad.load(std::memory_order_relaxed)) return bad_result();
+  if (bad.load(std::memory_order_relaxed)) return false;
 
   for (int t = 0; t < n_threads; ++t) {
     XtVinvX += XtVinvX_loc[t];
@@ -291,10 +247,83 @@ Rcpp::List reml_loglik_cpp_impl(
     logdetV += logdetV_loc[t];
     quad += quad_loc[t];
   }
+  return true;
+}
+
+
+// ============================================================
+// Main REML log-likelihood computation
+// ============================================================
+
+// [[Rcpp::export]]
+Rcpp::List reml_loglik_cpp_impl(
+    Rcpp::XPtr<PreparedModel> model_xptr,
+    const Eigen::VectorXd& theta,
+    bool return_penalty,
+    bool return_timing
+) {
+  const PreparedModel& model = *model_xptr;
+  // Convert theta to Eigen vector
+  auto t_start = std::chrono::high_resolution_clock::now();
+  //const VectorXd& theta = theta_r;
+  const auto& groups = model.groups;
+  const VectorXd& y = model.y;
+  int p = model.p;
+  int q = model.q;
+  int n_corr = model.n_corr;
+  //double lo_sigma = model.lo_sigma;
+  //double hi_sigma = model.hi_sigma;
+
+  //int n_groups = groups.size();
+  
+  // Extract parameters from theta
+  VectorXd log_sds = theta.head(q);
+  VectorXd corrs_unconstrained = theta.segment(q, n_corr);
+  double log_sigma_resid = theta(q + n_corr);
+  
+  // Parameter validation
+  VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
+  if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
+  if (log_sigma_resid < std::log(std::numeric_limits<double>::epsilon())) return bad_result();
+  
+  // Build Cholesky factor L and compute G = L L'
+  MatrixXd L = build_cholesky_cpp(theta, q);
+  MatrixXd G = L * L.transpose();
+  
+  // Add jitter for numerical stability
+  G.diagonal().array() += 1e-8;
+  
+  // Compute G_inv using Eigen's LLT Cholesky solver (more stable than direct inversion)
+  Eigen::LLT<MatrixXd> llt_G(G);
+  if (llt_G.info() != Eigen::Success) return bad_result();
+  MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(q, q));
+  
+  // Compute log-determinant of G from Cholesky factor
+  double logdetG = 2.0 * llt_G.matrixLLT().diagonal().array().log().sum();
+  
+  double sigma = std::exp(log_sigma_resid);
+  double sigma2 = sigma * sigma;
+  
+  // Calculate random effects penalties for flat regions and extreme values
+  double penalty = compute_penalty(model, log_sds);
+
+  auto t_after_build = std::chrono::high_resolution_clock::now();
+  double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
+  
+  // Accumulate sufficient statistics across groups
+  MatrixXd XtVinvX = MatrixXd::Zero(p, p);
+  VectorXd XtVinvy = VectorXd::Zero(p);
+  double logdetV = 0.0;
+  double quad = 0.0;
+
+  auto t_loop_start = std::chrono::high_resolution_clock::now();
+  bool success = accumulate_groups(model, G_inv, sigma2, XtVinvX, XtVinvy, logdetV, quad);
+  if (!success) return bad_result();
+
   auto t_after_groups = std::chrono::high_resolution_clock::now();
   double t_groups = std::chrono::duration<double>(t_after_groups - t_loop_start).count();
   
-  logdetV += n_groups * logdetG;
+  logdetV += groups.size() * logdetG;
   
   // Compute XtVinvX^{-1} using Cholesky
   Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);

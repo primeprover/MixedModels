@@ -155,4 +155,12 @@ for (t_idx in seq_along(th)) {
 }
 print(cbind(th, times))
 
-
+for (i in 1:10) {
+  cat("\n--- C++ engine test iteration", i, "---\n")  
+fit_mixed_simple(
+      formula = sbp ~ bmi + age,
+      random  = ~ 1 + bmi + age | patient,
+      data    = dat,
+      engine  = "C++"
+    )
+}

@@ -5,7 +5,7 @@
 tryCatch(
   Sys.setenv(PKG_CXXFLAGS = "-fopenmp -Wno-ignored-attributes -Wno-unused"),
   Sys.setenv(PKG_LIBS = "-fopenmp"),
-  Rcpp::sourceCpp("reml_loglik.cpp", rebuild = TRUE, showOutput = TRUE),
+  Rcpp::sourceCpp("reml_loglik.cpp", rebuild = TRUE, showOutput = TRUE, windowsDebugDLL = TRUE),
   error = function(e) {
     cat("Warning: Could not compile C++ engine. Using R engine only.\n")
     cat("  Details:", as.character(e), "\n")
@@ -154,7 +154,6 @@ reml_loglik_r <- function(theta, prepared, return_penalty = FALSE) {
     sum(pmax(0, log_sd - hi_sigma)^2) +
       sum(pmax(0, lo_sigma - log_sd)^2)
   ) * 1e-6
-
   G_inv <- tryCatch(chol2inv(chol(G)), error = function(e) NULL)
   if (is.null(G_inv)) return(bad_result())
   logdetG <- 2 * sum(log(diag(L)))
@@ -227,7 +226,7 @@ reml_loglik_cpp <- function(theta, model, return_penalty = FALSE) {
 
   tryCatch(
     {
-      result <- reml_loglik_cpp_impl(theta, model, return_penalty = TRUE, return_timing = TRUE)
+      result <- reml_loglik_cpp_impl(model, theta, return_penalty = TRUE, return_timing = TRUE)
 
       if (return_penalty) {
         return(list(
@@ -241,7 +240,7 @@ reml_loglik_cpp <- function(theta, model, return_penalty = FALSE) {
       }
     },
     error = function(e) {
-      stop("C++ engine is not available. Details: ", as.character(e))
+      stop("C++ engine is not available. Details _ : ", as.character(e))
     }
   )
 }
@@ -258,7 +257,7 @@ fit_mixed_simple <- function(formula, random, data,
   # Route to appropriate engine
   if (engine == "C++") {
     extract_time <- system.time(model <- init_model_cpp(prepared), gcFirst = FALSE)
-    
+    print("Model initialized in C++ engine")
     # Delegate likelihood computation to compiled C++ code
     reml_fun <- function(theta, return_penalty = FALSE) {
       reml_loglik_cpp(theta, model, return_penalty)
@@ -296,7 +295,7 @@ fit_mixed_simple <- function(formula, random, data,
       method = "L-BFGS-B",
       lower = lower,
       upper = upper,
-      control = list(maxit = maxit, trace = ifelse(isTRUE(verbose), 1, 0))
+      control = list(maxit = maxit, verbose = TRUE, trace = ifelse(isTRUE(verbose), 1, 0))
     )
   })
 
