@@ -211,8 +211,12 @@ Rcpp::List reml_loglik_cpp_impl(
     double excess_hi = std::max(0.0, log_sds(i) - hi_sigma);
     double excess_lo = std::max(0.0, lo_sigma - log_sds(i));
     penalty += excess_hi * excess_hi + excess_lo * excess_lo;
+    penalty += log_sds(i) * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   }
   penalty *= 1e-6;
+  //std::cout << "Penalty: " << penalty << " Lo_sigma: " << lo_sigma << " Hi_sigma: " << hi_sigma << std::endl;
+  
+  
   auto t_after_build = std::chrono::high_resolution_clock::now();
   double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
   

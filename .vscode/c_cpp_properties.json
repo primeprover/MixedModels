@@ -1,0 +1,27 @@
+{
+    "configurations": [
+        {
+            "name": "Win32",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${vcpkgRoot}/x64-windows/include",
+                "${vcpkgRoot}/x86-windows/include",
+                "C:\\Users\\david\\AppData\\Local\\R\\win-library\\4.3\\Rcpp\\include",
+                "C:\\Users\\david\\AppData\\Local\\R\\win-library\\4.3\\RcppEigen\\include",
+                "C:\\Program Files\\R\\R-4.3.1\\include"
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE",
+                "_OPENMP"
+            ],
+            "windowsSdkVersion": "10.0.22621.0",
+            "compilerPath": "cl.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ],
+    "version": 4
+}
