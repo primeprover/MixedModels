@@ -242,7 +242,7 @@ double compute_penalty(
     //std::cout << "Penalty from log_sigma_resid: " << penalty << std::endl;
     penalty *= 10.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   }
-  std::cout << "Penalty from residuals: " << penalty << std::endl;
+  //std::cout << "Penalty from residuals: " << penalty << std::endl;
   // TODO: fix above penalty to be the same in both cases (heteroscedastic and homoscedastic)
   // Maybe it should be on the parameters
   penalty = 0.0;
