@@ -224,19 +224,33 @@ inline Rcpp::List bad_result()
 double compute_penalty(
   const PreparedModel& model,  
   const VectorXd& log_sds,
-  const VectorXd& gamma
+  const VectorXd& gamma,
+  const double log_sigma_resid
     ) {
 
   // Compute penalty on log-SDs
   double penalty = 0.0;
-  for (const auto& g : model.working.groups)
-    penalty += g.eta.squaredNorm();
-  penalty *= 100.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
+  if (model.heteroscedastic) {
+    for (const auto& g : model.working.groups)
+      penalty -= g.eta.squaredNorm();
+    penalty *= 10.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
+  }
+  else {
+    for (const auto& g : model.groups)
+    //  penalty -= g.n * std::exp(2.0 * log_sigma_resid);
+      penalty -= g.n * 4.0 * log_sigma_resid * log_sigma_resid;
+    //std::cout << "Penalty from log_sigma_resid: " << penalty << std::endl;
+    penalty *= 10.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
+  }
+  std::cout << "Penalty from residuals: " << penalty << std::endl;
+  // TODO: fix above penalty to be the same in both cases (heteroscedastic and homoscedastic)
+  // Maybe it should be on the parameters
+  penalty = 0.0;
   for (int i = 0; i < model.q; ++i) {
     double excess_hi = std::max(0.0, log_sds(i) - model.hi_sigma);
     double excess_lo = std::max(0.0, model.lo_sigma - log_sds(i));
     penalty += excess_hi * excess_hi + excess_lo * excess_lo;
-    penalty += log_sds(i) * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
+    penalty += log_sds(i) * 1000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   }
   //penalty += gamma.squaredNorm() * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   penalty *= 1e-6;
@@ -532,7 +546,7 @@ Rcpp::List reml_loglik_cpp_impl(
   VectorXd gamma;
 
   if (!model.heteroscedastic) {
-    log_sigma_resid = theta(q + n_corr);
+    log_sigma_resid = 0.5*theta(q + n_corr);
   } else {
     k = model.groups[0].W.cols();
     gamma = theta.segment(q + n_corr, k);
@@ -567,7 +581,7 @@ Rcpp::List reml_loglik_cpp_impl(
   double logdetG = 2.0 * llt_G.matrixLLT().diagonal().array().log().sum();
   
   // Calculate random effects penalties for flat regions and extreme values
-  double penalty = compute_penalty(model, log_sds, gamma);
+  double penalty = compute_penalty(model, log_sds, gamma, log_sigma_resid);
 
   auto t_after_build = std::chrono::high_resolution_clock::now();
   double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
@@ -605,7 +619,9 @@ Rcpp::List reml_loglik_cpp_impl(
   VectorXd beta_hat = llt_XtVinvX.solve(XtVinvy);
   
   // Compute quadratic residual
-  double quad_res = quad - beta_hat.transpose() * XtVinvy;
+  double quad_res = 0.0;
+  
+  quad_res = quad - beta_hat.transpose() * XtVinvy;
   quad_res = std::max(0.0, quad_res);
   
   // Compute REML log-likelihood

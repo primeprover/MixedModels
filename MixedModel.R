@@ -138,7 +138,7 @@ init_theta_general <- function(prepared) {
   log_sds <- rep(log(max(y_sd * 0.02, 1e-6)), q)
   corrs_init <- rep(0, n_corr)
   if (!prepared$heteroscedastic) {
-    log_sigma_resid <- log(max(y_sd * 0.2, 1e-6))
+    log_sigma_resid <- 2 * log(max(y_sd * 0.2, 1e-6))
     c(log_sds, corrs_init, log_sigma_resid)
   } else {
     W <- model.matrix(prepared$var_pred, prepared$data)
