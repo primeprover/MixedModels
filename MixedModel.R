@@ -13,7 +13,7 @@ tryCatch(
 )
 
 
-prepare_mixed_data <- function(formula, random, data) {
+prepare_mixed_data <- function(formula, random, var_pred = NULL, data) {
   if (!inherits(random, "formula")) {
     stop("random must be a formula, e.g. ~ bmi + age | patient")
   }
@@ -21,7 +21,11 @@ prepare_mixed_data <- function(formula, random, data) {
   if (!is.call(random_rhs) || random_rhs[[1]] != as.name("|")) {
     stop("random formula must be of the form '~ <effects> | <group>'")
   }
-
+  heteroscedastic <- FALSE
+  if (!is.null(var_pred)) {
+    heteroscedastic <- TRUE
+    W <- model.matrix(var_pred, data)
+  }
   random_effects_expr <- random_rhs[[2]]
   group_expr <- random_rhs[[3]]
   random_formula <- as.formula(call("~", random_effects_expr))
@@ -50,24 +54,43 @@ prepare_mixed_data <- function(formula, random, data) {
   lo_sigma <- log(sigma_y) - 6
   hi_sigma <- log(sigma_y) + 4
 
-  group_list <- lapply(split_idx, function(idx) {
-    Xi <- X[idx, , drop = FALSE]
-    Zi <- Z[idx, , drop = FALSE]
-    yi <- y[idx]
-    list(
-      X = Xi,
-      Z = Zi,
-      y = yi,
-      n = nrow(Xi),
-      ZtZ = crossprod(Zi),
-      ZtY = crossprod(Zi, yi),
-      ZtX = crossprod(Zi, Xi)
-    )
-  })
-
+  if (heteroscedastic) {
+    group_list <- lapply(split_idx, function(idx) {
+      Xi <- X[idx, , drop = FALSE]
+      Zi <- Z[idx, , drop = FALSE]
+      yi <- y[idx]
+      wi <- W[idx, , drop = FALSE]
+      list(
+        X = Xi,
+        Z = Zi,
+        y = yi,
+        n = nrow(Xi),
+        ZtZ = crossprod(Zi),
+        ZtY = crossprod(Zi, yi),
+        ZtX = crossprod(Zi, Xi),
+        W = wi
+      )
+    })
+  } else {
+    group_list <- lapply(split_idx, function(idx) {
+      Xi <- X[idx, , drop = FALSE]
+      Zi <- Z[idx, , drop = FALSE]
+      yi <- y[idx]
+      list(
+        X = Xi,
+        Z = Zi,
+        y = yi,
+        n = nrow(Xi),
+        ZtZ = crossprod(Zi),
+        ZtY = crossprod(Zi, yi),
+        ZtX = crossprod(Zi, Xi)
+      )
+    })
+  }
   list(
     formula = formula,
     random = random,
+    var_pred = var_pred,
     data = data,
     X = X,
     Z = Z,
@@ -80,7 +103,8 @@ prepare_mixed_data <- function(formula, random, data) {
     n_corr = n_corr,
     sigma_y = sigma_y,
     lo_sigma = lo_sigma,
-    hi_sigma = hi_sigma
+    hi_sigma = hi_sigma,
+    heteroscedastic = heteroscedastic
   )
 }
 
@@ -113,8 +137,17 @@ init_theta_general <- function(prepared) {
 
   log_sds <- rep(log(max(y_sd * 0.02, 1e-6)), q)
   corrs_init <- rep(0, n_corr)
-  log_sigma_resid <- log(max(y_sd * 0.2, 1e-6))
-  c(log_sds, corrs_init, log_sigma_resid)
+  if (!prepared$heteroscedastic) {
+    log_sigma_resid <- log(max(y_sd * 0.2, 1e-6))
+    c(log_sds, corrs_init, log_sigma_resid)
+  } else {
+    W <- model.matrix(prepared$var_pred, prepared$data)
+    target <- rep(2 * log(max(y_sd * 0.2, 1e-6)), nrow(W))
+    gamma_init <- qr.solve(W, target)
+    #gamma_init <- rep(0, ncol(prepared$group_list[[1]]$W))
+    #gamma_init <- 2*log(max(y_sd * 0.2, 1e-6))
+    c(log_sds, corrs_init, gamma_init)
+  }
 }
 
 reml_loglik_r <- function(theta, prepared, return_penalty = FALSE) {
@@ -245,15 +278,16 @@ reml_loglik_cpp <- function(theta, model, return_penalty = FALSE) {
   )
 }
 
-fit_mixed_simple <- function(formula, random, data,
+fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
                              maxit = 100, verbose = TRUE,
                              engine = "C++") {
   engine <- match.arg(engine)
   
   fake_time <- system.time({}, gcFirst = FALSE)  # Dummy timing to avoid first-time overhead
   print(fake_time)
-  prepare_time <- system.time(prepared <- prepare_mixed_data(formula, random, data), gcFirst = FALSE)
-    
+  prepare_time <- system.time(prepared <- prepare_mixed_data(formula, random, var_pred, data), gcFirst = FALSE)
+  print("Data prepared")
+  print(names(prepared))
   # Route to appropriate engine
   if (engine == "C++") {
     extract_time <- system.time(model <- init_model_cpp(prepared), gcFirst = FALSE)
@@ -264,12 +298,17 @@ fit_mixed_simple <- function(formula, random, data,
     }
   } else {
     # Use pure R implementation
+    if (!is.null(var_pred)) {
+      stop("Heteroscedastic variance modeling is only supported in the C++ engine.")
+    }
     reml_fun <- function(theta, return_penalty = FALSE) {
       reml_loglik_r(theta, prepared, return_penalty)
     }
   }
   initial_values_time <- system.time( {
     theta_init <- init_theta_general(prepared)
+    print("Initial theta values:")
+    print(theta_init)
     theta_len <- prepared$q + prepared$n_corr + 1
     y_sd <- prepared$sigma_y
 
@@ -295,7 +334,7 @@ fit_mixed_simple <- function(formula, random, data,
       method = "L-BFGS-B",
       lower = lower,
       upper = upper,
-      control = list(maxit = maxit, verbose = TRUE, trace = ifelse(isTRUE(verbose), 1, 0))
+      control = list(maxit = maxit, trace = 2)
     )
   })
 

@@ -7,7 +7,62 @@ library(nlme)
 library(lme4)
 
 source("MixedModel.R")
+
 source("DataSimulation.R")
+
+fit_mixed_simple(
+      formula = sbp ~ bmi + age,
+      random  = ~ 1 + bmi + age | patient,
+      data    = dat,
+      engine  = "C++"
+    )
+    
+fit_mixed_simple(
+    formula = sbp ~ bmi + age,
+    random  = ~ 1 + bmi + age | patient,
+    var_pred = ~ 1,
+    data    = dat,
+    engine  = "C++"
+  )
+
+tryCatch(
+  Sys.setenv(PKG_CXXFLAGS = "-fopenmp -Wno-ignored-attributes -Wno-unused"),
+  Sys.setenv(PKG_LIBS = "-fopenmp"),
+  Rcpp::sourceCpp("reml_loglik.cpp", rebuild = TRUE, showOutput = TRUE, windowsDebugDLL = TRUE),
+  error = function(e) {
+    cat("Warning: Could not compile C++ engine. Using R engine only.\n")
+    cat("  Details:", as.character(e), "\n")
+  }
+)
+
+fit_mixed_simple(
+    formula = sbp ~ bmi + age,
+    random  = ~ 1 + bmi + age | patient,
+    var_pred = ~ 1 + bmi + age,
+    data    = dat,
+    engine  = "C++"
+  )
+
+tryCatch({
+  fit_cpp <- fit_mixed_simple(
+    formula = sbp ~ bmi + age,
+    random  = ~ 1 + bmi + age | patient,
+    var_pred = ~ 1,
+    data    = dat,
+    engine  = "C++"
+  )
+}, error = function(e) {
+  cat("Error in C++ engine:", as.character(e), "\n")
+  NULL
+})
+
+fit_mixed_simple(
+      formula = sbp ~ bmi + age,
+      random  = ~ 1 + bmi + age | patient,
+      var_pred = ~ 1,
+      data    = dat,
+      engine  = "C++"
+    )
 
 ## ============================================================
 ## Reference fit using nlme::lme
@@ -155,12 +210,25 @@ for (t_idx in seq_along(th)) {
 }
 print(cbind(th, times))
 
-for (i in 1:10) {
-  cat("\n--- C++ engine test iteration", i, "---\n")  
+#for (i in 1:10) {
+#  cat("\n--- C++ engine test iteration", i, "---\n")  
+
+## homoscedastic case
 fit_mixed_simple(
       formula = sbp ~ bmi + age,
       random  = ~ 1 + bmi + age | patient,
       data    = dat,
       engine  = "C++"
     )
-}
+
+
+## homoscedastic case with heteroscedastic variance modeling
+fit_mixed_simple(
+      formula = sbp ~ bmi + age,
+      random  = ~ 1 + bmi + age | patient,
+      var_pred = ~ 1,
+      data    = dat,
+      engine  = "C++"
+    )
+
+#}

@@ -29,6 +29,16 @@ void set_threads_cpp(int n_threads) {
 #endif
 }
 
+struct WorkingGroup {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  VectorXd eta;          // linear predictor for log(residual variance)
+  VectorXd inv_resid_var; // 1 / residual variances
+};
+
+struct WorkingModel {
+  std::vector<WorkingGroup> groups; // one per group
+};
+
 // Group data structure: precomputed matrices for a single group
 struct GroupData {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -39,6 +49,7 @@ struct GroupData {
   MatrixXd ZtZ;    // Z'Z (precomputed)
   VectorXd ZtY;    // Z'y (precomputed)
   MatrixXd ZtX;    // Z'X (precomputed)
+  MatrixXd W;      // design matrix for residual variance (if heteroscedastic)
 };
 
 struct PreparedModel {
@@ -47,15 +58,20 @@ struct PreparedModel {
   int p;
   int q;
   int n_corr;
+  bool heteroscedastic;
 
   double lo_sigma;
   double hi_sigma;
 
   // static data
   VectorXd y;
+  MatrixXd W; // design matrix for residual variance (if heteroscedastic)
 
   // grouped structure
   std::vector<GroupData> groups;
+
+  // working model - Mutable state that is updated during optimization
+  WorkingModel working;
 };
 
 // Extract group data from R list
@@ -76,9 +92,28 @@ std::vector<GroupData> extract_groups(const Rcpp::List& prepared) {
     groups[i].ZtZ = Rcpp::as<MatrixXd>(group_i["ZtZ"]);
     groups[i].ZtY = Rcpp::as<VectorXd>(group_i["ZtY"]);
     groups[i].ZtX = Rcpp::as<MatrixXd>(group_i["ZtX"]);
+    if (prepared["heteroscedastic"]) {
+      groups[i].W = Rcpp::as<MatrixXd>(group_i["W"]);
+    }
   }
 
   return groups;
+}
+
+WorkingModel initialise_working_model(
+    const PreparedModel& model
+)
+{
+    WorkingModel working;
+
+    working.groups.resize(model.groups.size());
+    for (int g = 0; g < (int)model.groups.size(); ++g) {
+        const int n = model.groups[g].n;
+
+        working.groups[g].eta.resize(n);
+        working.groups[g].inv_resid_var.resize(n);
+    }
+    return working;
 }
 
 // [[Rcpp::export]]
@@ -90,12 +125,47 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   model->n_corr   = prepared["n_corr"];
   model->lo_sigma = prepared["lo_sigma"];
   model->hi_sigma = prepared["hi_sigma"];
+  model->heteroscedastic = prepared["heteroscedastic"];
 
   model->y = Rcpp::as<VectorXd>(prepared["y"]);
-
   model->groups = extract_groups(prepared);
-  
+  std::cout << "Data prepared apart from working" << std::endl;
+  _sleep(1000); // Sleep for 1 second to allow time for the message to be viewed
+  model->working = initialise_working_model(*model);
   return Rcpp::XPtr<PreparedModel>(model, true);
+}
+
+void update_working_model(
+    PreparedModel& model,
+    const Eigen::VectorXd& gamma
+)
+{
+  //std::cout << "Updating working model" << std::endl;
+  //std::cout << "Number of groups: " << model.groups.size() << std::endl;
+  //model.working.groups.resize(model.groups.size());
+  for (int g = 0; g < (int)model.groups.size(); ++g) {
+    //std::cout << "Group " << g << std::endl;
+    const auto& group = model.groups[g];
+    
+    //std::cout << "  W: "
+    //          << group.W.rows() << " x "
+    //          << group.W.cols() << std::endl;
+    
+    //std::cout << "  gamma: "
+     //         << gamma.size() << std::endl;
+
+    //std::cout << "  eta size: "
+    //          << model.working.groups[g].eta.size() << std::endl;
+
+    //std::cout << "  Before multiply" << std::endl;
+
+    model.working.groups[g].eta.noalias() =
+        group.W * gamma;
+
+    model.working.groups[g].inv_resid_var.array() =
+        (-model.working.groups[g].eta.array()).exp();
+  }
+  //std::cout << "Updated working model" << std::endl;
 }
 
 // Build Cholesky factor L from unconstrained parameters
@@ -153,17 +223,22 @@ inline Rcpp::List bad_result()
 
 double compute_penalty(
   const PreparedModel& model,  
-  const VectorXd& log_sds
+  const VectorXd& log_sds,
+  const VectorXd& gamma
     ) {
 
   // Compute penalty on log-SDs
   double penalty = 0.0;
+  for (const auto& g : model.working.groups)
+    penalty += g.eta.squaredNorm();
+  penalty *= 100.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   for (int i = 0; i < model.q; ++i) {
     double excess_hi = std::max(0.0, log_sds(i) - model.hi_sigma);
     double excess_lo = std::max(0.0, model.lo_sigma - log_sds(i));
     penalty += excess_hi * excess_hi + excess_lo * excess_lo;
     penalty += log_sds(i) * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   }
+  //penalty += gamma.squaredNorm() * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   penalty *= 1e-6;
   //std::cout << "Penalty: " << penalty << " Lo_sigma: " << lo_sigma << " Hi_sigma: " << hi_sigma << std::endl;
   return penalty;
@@ -192,10 +267,10 @@ bool accumulate_groups(
   const auto& groups = model.groups;
   const VectorXd& y = model.y;
 
-  std::vector<MatrixXd> XtVinvX_loc(n_threads, MatrixXd::Zero(model.p, model.p));
-  std::vector<VectorXd> XtVinvy_loc(n_threads, VectorXd::Zero(model.p));
-  std::vector<double> logdetV_loc(n_threads, 0.0);
-  std::vector<double> quad_loc(n_threads, 0.0);
+  // std::vector<MatrixXd> XtVinvX_loc(n_threads, MatrixXd::Zero(model.p, model.p));
+  // std::vector<VectorXd> XtVinvy_loc(n_threads, VectorXd::Zero(model.p));
+  // std::vector<double> logdetV_loc(n_threads, 0.0);
+  // std::vector<double> quad_loc(n_threads, 0.0);
   std::atomic<bool> bad(false);
 
   const double inv_sigma2    = 1.0 / sigma2;
@@ -277,15 +352,158 @@ bool accumulate_groups(
 
   if (bad.load(std::memory_order_relaxed)) return false;
 
-  for (int t = 0; t < n_threads; ++t) {
-    XtVinvX += XtVinvX_loc[t];
-    XtVinvy += XtVinvy_loc[t];
-    logdetV += logdetV_loc[t];
-    quad += quad_loc[t];
-  }
+  // for (int t = 0; t < n_threads; ++t) {
+  //   XtVinvX += XtVinvX_loc[t];
+  //   XtVinvy += XtVinvy_loc[t];
+  //   logdetV += logdetV_loc[t];
+  //   quad += quad_loc[t];
+  // }
   return true;
 }
 
+bool accumulate_groups_hetero(
+    const PreparedModel& model,
+    const MatrixXd& G_inv,
+    MatrixXd& XtVinvX,
+    VectorXd& XtVinvy,
+    double& logdetV,
+    double& quad
+)
+{
+    int n_threads = 1;
+    Eigen::setNbThreads(1);
+
+#ifdef _OPENMP
+#pragma omp parallel
+    {
+#pragma omp master
+        n_threads = omp_get_num_threads();
+    }
+#endif
+
+    const auto& groups = model.groups;
+    const int p = model.p;
+
+    std::atomic<bool> bad(false);
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        const int tid =
+#ifdef _OPENMP
+            omp_get_thread_num();
+#else
+            0;
+#endif
+
+        MatrixXd XtVinvX_local = MatrixXd::Zero(p, p);
+        VectorXd XtVinvy_local = VectorXd::Zero(p);
+
+        double logdetV_local = 0.0;
+        double quad_local = 0.0;
+
+        MatrixXd K;
+        Eigen::LLT<MatrixXd> llt;
+
+        MatrixXd RinvZ;
+        MatrixXd RinvX;
+        VectorXd Rinvy;
+
+        MatrixXd ZtRinvZ;
+        MatrixXd ZtRinvX;
+        VectorXd ZtRinvy;
+
+        MatrixXd KinvZtRinvX;
+        VectorXd KinvZtRinvy;
+
+        MatrixXd VinvX;
+        VectorXd Vinvy;
+
+#ifdef _OPENMP
+#pragma omp for schedule(guided)
+#endif
+        for (int ig = 0; ig < (int)groups.size(); ++ig) {
+
+            if (bad.load(std::memory_order_relaxed))
+                continue;
+
+            const auto& group = groups[ig];
+            const auto& inv_resid_var = model.working.groups[ig].inv_resid_var;
+
+            // ----------------------------------------------------
+            // R^{-1} applied to Z, X, y
+            // ----------------------------------------------------
+
+            RinvZ = group.Z.array().colwise() * inv_resid_var.array();
+            RinvX = group.X.array().colwise() * inv_resid_var.array();
+            Rinvy = group.y.array() * inv_resid_var.array();
+
+            // ----------------------------------------------------
+            // Cross-products
+            // ----------------------------------------------------
+
+            ZtRinvZ.noalias() = group.Z.transpose() * RinvZ;
+            ZtRinvX.noalias() = group.Z.transpose() * RinvX;
+            ZtRinvy.noalias() = group.Z.transpose() * Rinvy;
+
+            // ----------------------------------------------------
+            // K = G^{-1} + Z'R^{-1}Z
+            // ----------------------------------------------------
+
+            K = G_inv;
+            K.noalias() += ZtRinvZ;
+
+            llt.compute(K);
+
+            if (llt.info() != Eigen::Success) {
+                bad.store(true, std::memory_order_relaxed);
+                continue;
+            }
+
+            const auto& L = llt.matrixLLT();
+            double logdetK = 2.0 * L.diagonal().array().log().sum();
+
+            // ----------------------------------------------------
+            // solves
+            // ----------------------------------------------------
+
+            KinvZtRinvy = llt.solve(ZtRinvy);
+            KinvZtRinvX = llt.solve(ZtRinvX);
+
+            // ----------------------------------------------------
+            // Woodbury: V^{-1}y and V^{-1}X
+            // ----------------------------------------------------
+
+            Vinvy.noalias() = Rinvy - RinvZ * KinvZtRinvy;
+            VinvX.noalias() = RinvX - RinvZ * KinvZtRinvX;
+
+            // ----------------------------------------------------
+            // accumulate
+            // ----------------------------------------------------
+
+            XtVinvX_local.noalias() += group.X.transpose() * VinvX;
+            XtVinvy_local.noalias() += group.X.transpose() * Vinvy;
+
+            quad_local += group.y.dot(Vinvy);
+
+            // log|V| = log|R| + log|G^{-1}+Z'R^{-1}Z| + log|G|
+            logdetV_local += model.working.groups[ig].eta.sum() + logdetK;
+        }
+
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+        {
+            XtVinvX += XtVinvX_local;
+            XtVinvy += XtVinvy_local;
+            logdetV += logdetV_local;
+            quad += quad_local;
+        }
+    }
+
+    return !bad.load();
+}
 
 // ============================================================
 // Main REML log-likelihood computation
@@ -298,7 +516,7 @@ Rcpp::List reml_loglik_cpp_impl(
     bool return_penalty,
     bool return_timing
 ) {
-  const PreparedModel& model = *model_xptr;
+  PreparedModel& model = *model_xptr;
   // Convert theta to Eigen vector
   auto t_start = std::chrono::high_resolution_clock::now();
   //const VectorXd& theta = theta_r;
@@ -307,20 +525,31 @@ Rcpp::List reml_loglik_cpp_impl(
   int p = model.p;
   int q = model.q;
   int n_corr = model.n_corr;
+  VectorXd log_sds = theta.head(q);
+  VectorXd corrs_unconstrained = theta.segment(q, n_corr);
+  double log_sigma_resid = 0.0;
+  int k = 0;
+  VectorXd gamma;
+
+  if (!model.heteroscedastic) {
+    log_sigma_resid = theta(q + n_corr);
+  } else {
+    k = model.groups[0].W.cols();
+    gamma = theta.segment(q + n_corr, k);
+    //std::cout << "Updating working model with " << k << " columns" << std::endl;
+    update_working_model(model, gamma);
+  }
   //double lo_sigma = model.lo_sigma;
   //double hi_sigma = model.hi_sigma;
 
   //int n_groups = groups.size();
   
   // Extract parameters from theta
-  VectorXd log_sds = theta.head(q);
-  VectorXd corrs_unconstrained = theta.segment(q, n_corr);
-  double log_sigma_resid = theta(q + n_corr);
   
   // Parameter validation
   VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
   if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
-  if (log_sigma_resid < std::log(std::numeric_limits<double>::epsilon())) return bad_result();
+  if (!model.heteroscedastic && log_sigma_resid < std::log(std::numeric_limits<double>::epsilon())) return bad_result();
   
   // Build Cholesky factor L and compute G = L L'
   MatrixXd L = build_cholesky_cpp(theta, q);
@@ -337,11 +566,8 @@ Rcpp::List reml_loglik_cpp_impl(
   // Compute log-determinant of G from Cholesky factor
   double logdetG = 2.0 * llt_G.matrixLLT().diagonal().array().log().sum();
   
-  double sigma = std::exp(log_sigma_resid);
-  double sigma2 = sigma * sigma;
-  
   // Calculate random effects penalties for flat regions and extreme values
-  double penalty = compute_penalty(model, log_sds);
+  double penalty = compute_penalty(model, log_sds, gamma);
 
   auto t_after_build = std::chrono::high_resolution_clock::now();
   double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
@@ -353,13 +579,22 @@ Rcpp::List reml_loglik_cpp_impl(
   double quad = 0.0;
 
   auto t_loop_start = std::chrono::high_resolution_clock::now();
-  bool success = accumulate_groups(model, G_inv, sigma2, XtVinvX, XtVinvy, logdetV, quad);
-  if (!success) return bad_result();
-
+  if (!model.heteroscedastic) {
+    double sigma = std::exp(log_sigma_resid);
+    double sigma2 = sigma * sigma;
+  
+    bool success = accumulate_groups(model, G_inv, sigma2, XtVinvX, XtVinvy, logdetV, quad);
+    if (!success) return bad_result();
+  }
+  else {
+    bool success = accumulate_groups_hetero(model, G_inv, XtVinvX, XtVinvy, logdetV, quad);
+    if (!success) return bad_result();
+  }
   auto t_after_groups = std::chrono::high_resolution_clock::now();
   double t_groups = std::chrono::duration<double>(t_after_groups - t_loop_start).count();
   
-  logdetV += groups.size() * logdetG;
+  //if (!model.heteroscedastic)
+    logdetV += groups.size() * logdetG;
   
   // Compute XtVinvX^{-1} using Cholesky
   Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
