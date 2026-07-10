@@ -74,6 +74,34 @@ struct PreparedModel {
   WorkingModel working;
 };
 
+struct GroupWorkspace {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    // Response model outputs
+    MatrixXd RinvZ;
+    MatrixXd RinvX;
+    VectorXd Rinvy;
+
+    // Random effects intermediates
+    MatrixXd ZtRinvZ;
+    MatrixXd ZtRinvX;
+    VectorXd ZtRinvy;
+
+    MatrixXd K;
+
+    MatrixXd KinvZtRinvX;
+    VectorXd KinvZtRinvy;
+
+    // Final outputs
+    MatrixXd VinvX;
+    VectorXd Vinvy;
+
+    double logdetR = 0.0;
+    double logdetK = 0.0;
+
+    Eigen::LLT<MatrixXd> llt;
+};
+
 // Extract group data from R list
 // This converts prepared$group_list (R list) into C++ vector of GroupData
 // INPUT: Rcpp::List prepared
@@ -130,7 +158,7 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   model->y = Rcpp::as<VectorXd>(prepared["y"]);
   model->groups = extract_groups(prepared);
   std::cout << "Data prepared apart from working" << std::endl;
-  _sleep(1000); // Sleep for 1 second to allow time for the message to be viewed
+  //_sleep(1000); // Sleep for 1 second to allow time for the message to be viewed
   model->working = initialise_working_model(*model);
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
@@ -375,6 +403,68 @@ bool accumulate_groups(
   return true;
 }
 
+inline void hetero_normal_response_compute(
+    const GroupData& group,
+    const WorkingGroup& working,
+    GroupWorkspace& ws)
+{
+    const auto& inv_resid_var = working.inv_resid_var;
+
+    ws.RinvZ =
+        group.Z.array().colwise() * inv_resid_var.array();
+
+    ws.RinvX =
+        group.X.array().colwise() * inv_resid_var.array();
+
+    ws.Rinvy =
+        group.y.array() * inv_resid_var.array();
+
+    ws.logdetR = working.eta.sum();
+}
+
+inline bool random_effects_compute(
+    const GroupData& group,
+    const MatrixXd& G_inv,
+    GroupWorkspace& ws)
+{
+    ws.ZtRinvZ.noalias() =
+        group.Z.transpose() * ws.RinvZ;
+
+    ws.ZtRinvX.noalias() =
+        group.Z.transpose() * ws.RinvX;
+
+    ws.ZtRinvy.noalias() =
+        group.Z.transpose() * ws.Rinvy;
+
+    ws.K = G_inv;
+    ws.K.noalias() += ws.ZtRinvZ;
+
+    ws.llt.compute(ws.K);
+
+    if (ws.llt.info() != Eigen::Success)
+      return false;
+
+    ws.logdetK =
+        2.0 *
+        ws.llt.matrixLLT().diagonal().array().log().sum();
+
+    ws.KinvZtRinvX =
+        ws.llt.solve(ws.ZtRinvX);
+
+    ws.KinvZtRinvy =
+        ws.llt.solve(ws.ZtRinvy);
+
+    ws.VinvX.noalias() =
+        ws.RinvX -
+        ws.RinvZ * ws.KinvZtRinvX;
+
+    ws.Vinvy.noalias() =
+        ws.Rinvy -
+        ws.RinvZ * ws.KinvZtRinvy;
+    
+    return true;
+}
+
 bool accumulate_groups_hetero(
     const PreparedModel& model,
     const MatrixXd& G_inv,
@@ -384,16 +474,7 @@ bool accumulate_groups_hetero(
     double& quad
 )
 {
-    int n_threads = 1;
     Eigen::setNbThreads(1);
-
-#ifdef _OPENMP
-#pragma omp parallel
-    {
-#pragma omp master
-        n_threads = omp_get_num_threads();
-    }
-#endif
 
     const auto& groups = model.groups;
     const int p = model.p;
@@ -404,105 +485,42 @@ bool accumulate_groups_hetero(
 #pragma omp parallel
 #endif
     {
-        const int tid =
-#ifdef _OPENMP
-            omp_get_thread_num();
-#else
-            0;
-#endif
-
         MatrixXd XtVinvX_local = MatrixXd::Zero(p, p);
         VectorXd XtVinvy_local = VectorXd::Zero(p);
 
         double logdetV_local = 0.0;
         double quad_local = 0.0;
 
-        MatrixXd K;
-        Eigen::LLT<MatrixXd> llt;
-
-        MatrixXd RinvZ;
-        MatrixXd RinvX;
-        VectorXd Rinvy;
-
-        MatrixXd ZtRinvZ;
-        MatrixXd ZtRinvX;
-        VectorXd ZtRinvy;
-
-        MatrixXd KinvZtRinvX;
-        VectorXd KinvZtRinvy;
-
-        MatrixXd VinvX;
-        VectorXd Vinvy;
+        GroupWorkspace workspace;
 
 #ifdef _OPENMP
 #pragma omp for schedule(guided)
 #endif
         for (int ig = 0; ig < (int)groups.size(); ++ig) {
 
-            if (bad.load(std::memory_order_relaxed))
-                continue;
-
             const auto& group = groups[ig];
-            const auto& inv_resid_var = model.working.groups[ig].inv_resid_var;
 
-            // ----------------------------------------------------
-            // R^{-1} applied to Z, X, y
-            // ----------------------------------------------------
+            hetero_normal_response_compute(group,model.working.groups[ig], workspace);
 
-            RinvZ = group.Z.array().colwise() * inv_resid_var.array();
-            RinvX = group.X.array().colwise() * inv_resid_var.array();
-            Rinvy = group.y.array() * inv_resid_var.array();
-
-            // ----------------------------------------------------
-            // Cross-products
-            // ----------------------------------------------------
-
-            ZtRinvZ.noalias() = group.Z.transpose() * RinvZ;
-            ZtRinvX.noalias() = group.Z.transpose() * RinvX;
-            ZtRinvy.noalias() = group.Z.transpose() * Rinvy;
-
-            // ----------------------------------------------------
-            // K = G^{-1} + Z'R^{-1}Z
-            // ----------------------------------------------------
-
-            K = G_inv;
-            K.noalias() += ZtRinvZ;
-
-            llt.compute(K);
-
-            if (llt.info() != Eigen::Success) {
+            if (!random_effects_compute(group, G_inv, workspace))
+            {
                 bad.store(true, std::memory_order_relaxed);
                 continue;
             }
-
-            const auto& L = llt.matrixLLT();
-            double logdetK = 2.0 * L.diagonal().array().log().sum();
-
-            // ----------------------------------------------------
-            // solves
-            // ----------------------------------------------------
-
-            KinvZtRinvy = llt.solve(ZtRinvy);
-            KinvZtRinvX = llt.solve(ZtRinvX);
-
-            // ----------------------------------------------------
-            // Woodbury: V^{-1}y and V^{-1}X
-            // ----------------------------------------------------
-
-            Vinvy.noalias() = Rinvy - RinvZ * KinvZtRinvy;
-            VinvX.noalias() = RinvX - RinvZ * KinvZtRinvX;
-
+            
             // ----------------------------------------------------
             // accumulate
             // ----------------------------------------------------
 
-            XtVinvX_local.noalias() += group.X.transpose() * VinvX;
-            XtVinvy_local.noalias() += group.X.transpose() * Vinvy;
 
-            quad_local += group.y.dot(Vinvy);
+            XtVinvX_local.noalias() += group.X.transpose() * workspace.VinvX;
+            XtVinvy_local.noalias() += group.X.transpose() * workspace.Vinvy;
 
-            // log|V| = log|R| + log|G^{-1}+Z'R^{-1}Z| + log|G|
-            logdetV_local += model.working.groups[ig].eta.sum() + logdetK;
+            quad_local += group.y.dot(workspace.Vinvy);
+
+            // group contribution:
+            // log|R| + log|G^{-1}+Z'R^{-1}Z|
+            logdetV_local += workspace.logdetR + workspace.logdetK;
         }
 
 #ifdef _OPENMP
