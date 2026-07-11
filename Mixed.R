@@ -203,6 +203,7 @@ for (t_idx in seq_along(th)) {
       fit_mixed_simple(
         formula = sbp ~ bmi + age,
         random  = ~ 1 + bmi + age | patient,
+        var_pred = ~ 1,
         data    = dat,
         engine  = "C++"
       ),
@@ -239,3 +240,12 @@ fit_mixed_simple(
     )
 
 #}
+
+set_threads_cpp(16)
+fit_mixed_simple(
+        formula = sbp ~ bmi + age,
+        random  = ~ 0 + bmi + age | patient,
+        var_pred = ~ 1,
+        data    = dat,
+        engine  = "C++", maxit = 1000
+      )

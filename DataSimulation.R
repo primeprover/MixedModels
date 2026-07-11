@@ -4,7 +4,7 @@ set.seed(123)
 ## ----------------------------
 ## Simulation parameters
 ## ----------------------------
-n_patients <- 10000
+n_patients <- 100000
 min_obs <- 3
 max_obs <- 100
 

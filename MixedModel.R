@@ -5,6 +5,7 @@
 tryCatch(
   Sys.setenv(PKG_CXXFLAGS = "-fopenmp -Wno-ignored-attributes -Wno-unused"),
   Sys.setenv(PKG_LIBS = "-fopenmp"),
+  Rcpp::sourceCpp("response.cpp", rebuild = TRUE, showOutput = TRUE, windowsDebugDLL = TRUE),
   Rcpp::sourceCpp("reml_loglik.cpp", rebuild = TRUE, showOutput = TRUE, windowsDebugDLL = TRUE),
   error = function(e) {
     cat("Warning: Could not compile C++ engine. Using R engine only.\n")
@@ -334,7 +335,7 @@ fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
       method = "L-BFGS-B",
       lower = lower,
       upper = upper,
-      control = list(maxit = maxit, trace = 2)
+      control = list(maxit = maxit, trace = 2, factr = 1e3)
     )
   })
 

@@ -2,105 +2,18 @@
 // C++ implementation of REML log-likelihood for mixed models using RcppEigen
 // This file provides a compiled engine for fit_mixed_simple(..., engine = "C++")
 
-#include <Rcpp.h>
-#include <RcppEigen.h>
+
+#include "reml_loglik.hpp"
+#include "Response.hpp"
 #include <cmath>
 #include <vector>
 #include <atomic>
 #include <chrono>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+#include <memory>
 
-using namespace Rcpp;
-using namespace Eigen;
 
 // [[Rcpp::depends(RcppEigen)]]
 // [[Rcpp::plugins(openmp)]]
-
-// ============================================================
-// Helper structures and functions
-// ============================================================
-
-// [[Rcpp::export]]
-void set_threads_cpp(int n_threads) {
-#ifdef _OPENMP
-    omp_set_num_threads(n_threads);
-#endif
-}
-
-struct WorkingGroup {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  VectorXd eta;          // linear predictor for log(residual variance)
-  VectorXd inv_resid_var; // 1 / residual variances
-};
-
-struct WorkingModel {
-  std::vector<WorkingGroup> groups; // one per group
-};
-
-// Group data structure: precomputed matrices for a single group
-struct GroupData {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  MatrixXd X;      // design matrix for fixed effects
-  MatrixXd Z;      // design matrix for random effects
-  VectorXd y;      // response vector
-  int n;           // number of observations
-  MatrixXd ZtZ;    // Z'Z (precomputed)
-  VectorXd ZtY;    // Z'y (precomputed)
-  MatrixXd ZtX;    // Z'X (precomputed)
-  MatrixXd W;      // design matrix for residual variance (if heteroscedastic)
-};
-
-struct PreparedModel {
-
-  // static scalar parameters
-  int p;
-  int q;
-  int n_corr;
-  bool heteroscedastic;
-
-  double lo_sigma;
-  double hi_sigma;
-
-  // static data
-  VectorXd y;
-  MatrixXd W; // design matrix for residual variance (if heteroscedastic)
-
-  // grouped structure
-  std::vector<GroupData> groups;
-
-  // working model - Mutable state that is updated during optimization
-  WorkingModel working;
-};
-
-struct GroupWorkspace {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-    // Response model outputs
-    MatrixXd RinvZ;
-    MatrixXd RinvX;
-    VectorXd Rinvy;
-
-    // Random effects intermediates
-    MatrixXd ZtRinvZ;
-    MatrixXd ZtRinvX;
-    VectorXd ZtRinvy;
-
-    MatrixXd K;
-
-    MatrixXd KinvZtRinvX;
-    VectorXd KinvZtRinvy;
-
-    // Final outputs
-    MatrixXd VinvX;
-    VectorXd Vinvy;
-
-    double logdetR = 0.0;
-    double logdetK = 0.0;
-
-    Eigen::LLT<MatrixXd> llt;
-};
 
 // Extract group data from R list
 // This converts prepared$group_list (R list) into C++ vector of GroupData
@@ -163,39 +76,6 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
-void update_working_model(
-    PreparedModel& model,
-    const Eigen::VectorXd& gamma
-)
-{
-  //std::cout << "Updating working model" << std::endl;
-  //std::cout << "Number of groups: " << model.groups.size() << std::endl;
-  //model.working.groups.resize(model.groups.size());
-  for (int g = 0; g < (int)model.groups.size(); ++g) {
-    //std::cout << "Group " << g << std::endl;
-    const auto& group = model.groups[g];
-    
-    //std::cout << "  W: "
-    //          << group.W.rows() << " x "
-    //          << group.W.cols() << std::endl;
-    
-    //std::cout << "  gamma: "
-     //         << gamma.size() << std::endl;
-
-    //std::cout << "  eta size: "
-    //          << model.working.groups[g].eta.size() << std::endl;
-
-    //std::cout << "  Before multiply" << std::endl;
-
-    model.working.groups[g].eta.noalias() =
-        group.W * gamma;
-
-    model.working.groups[g].inv_resid_var.array() =
-        (-model.working.groups[g].eta.array()).exp();
-  }
-  //std::cout << "Updated working model" << std::endl;
-}
-
 // Build Cholesky factor L from unconstrained parameters
 // theta layout: [log_sd_1, ..., log_sd_q, corr_uncon_1, ..., corr_uncon_n_corr, log_sigma_resid]
 // Returns L where G = L L' is the random effects covariance matrix
@@ -232,21 +112,6 @@ MatrixXd build_cholesky_cpp(const VectorXd& theta, int q) {
   }
   
   return L_corr;
-}
-
-inline Rcpp::List bad_result()
-{
-    Rcpp::List result;
-    result["logLik_unpenalized"] = -1e20;
-    result["logLik_penalized"] = -1e20;
-    result["penalty"] = NA_REAL;
-    // TODO: add newer timings
-    result["timings"] = Rcpp::List::create(
-        Rcpp::Named("build_G") = 0.0,
-        Rcpp::Named("groups") = 0.0,
-        Rcpp::Named("finalize") = 0.0
-    );
-    return result;
 }
 
 double compute_penalty(
@@ -403,25 +268,6 @@ bool accumulate_groups(
   return true;
 }
 
-inline void hetero_normal_response_compute(
-    const GroupData& group,
-    const WorkingGroup& working,
-    GroupWorkspace& ws)
-{
-    const auto& inv_resid_var = working.inv_resid_var;
-
-    ws.RinvZ =
-        group.Z.array().colwise() * inv_resid_var.array();
-
-    ws.RinvX =
-        group.X.array().colwise() * inv_resid_var.array();
-
-    ws.Rinvy =
-        group.y.array() * inv_resid_var.array();
-
-    ws.logdetR = working.eta.sum();
-}
-
 inline bool random_effects_compute(
     const GroupData& group,
     const MatrixXd& G_inv,
@@ -467,6 +313,7 @@ inline bool random_effects_compute(
 
 bool accumulate_groups_hetero(
     const PreparedModel& model,
+    const ResponseModel& response,
     const MatrixXd& G_inv,
     MatrixXd& XtVinvX,
     VectorXd& XtVinvy,
@@ -500,7 +347,7 @@ bool accumulate_groups_hetero(
 
             const auto& group = groups[ig];
 
-            hetero_normal_response_compute(group,model.working.groups[ig], workspace);
+            response.compute_group(group, model.working.groups[ig], workspace);
 
             if (!random_effects_compute(group, G_inv, workspace))
             {
@@ -562,14 +409,17 @@ Rcpp::List reml_loglik_cpp_impl(
   double log_sigma_resid = 0.0;
   int k = 0;
   VectorXd gamma;
+  std::unique_ptr<ResponseModel> response;
 
   if (!model.heteroscedastic) {
     log_sigma_resid = 0.5*theta(q + n_corr);
   } else {
+    response = std::make_unique<HeteroNormalResponse>();
+  
     k = model.groups[0].W.cols();
     gamma = theta.segment(q + n_corr, k);
     //std::cout << "Updating working model with " << k << " columns" << std::endl;
-    update_working_model(model, gamma);
+    response->update_working(model, gamma);
   }
   //double lo_sigma = model.lo_sigma;
   //double hi_sigma = model.hi_sigma;
@@ -619,7 +469,7 @@ Rcpp::List reml_loglik_cpp_impl(
     if (!success) return bad_result();
   }
   else {
-    bool success = accumulate_groups_hetero(model, G_inv, XtVinvX, XtVinvy, logdetV, quad);
+    bool success = accumulate_groups_hetero(model, *response, G_inv, XtVinvX, XtVinvy, logdetV, quad);
     if (!success) return bad_result();
   }
   auto t_after_groups = std::chrono::high_resolution_clock::now();
