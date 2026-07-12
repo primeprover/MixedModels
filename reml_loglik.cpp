@@ -5,6 +5,9 @@
 
 #include "reml_loglik.hpp"
 #include "response.hpp"
+#include "homo_normal_response.hpp"
+#include "hetero_normal_response.hpp"
+#include "response_factory.hpp"
 #include <cmath>
 #include <vector>
 #include <atomic>
@@ -51,11 +54,7 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   if (model->residual_variance_penalty_weight < 0.0)
     Rcpp::stop("residual_variance_penalty_weight must be non-negative.");
   model->groups = extract_groups(prepared);
-  const bool heteroscedastic = prepared["heteroscedastic"];
-  if (heteroscedastic)
-    model->responses.push_back(std::make_unique<HeteroNormalResponse>(prepared));
-  else
-    model->responses.push_back(std::make_unique<HomoNormalResponse>(prepared));
+  model->responses.push_back(make_response(prepared));
   model->responses.back()->initialise_working();
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
@@ -316,8 +315,7 @@ bool accumulate_groups_response(
             const auto& group = groups[ig];
             const auto& response_group = response.groups[ig];
 
-            response.compute_group(
-                group, response_group, response.working.groups[ig], workspace);
+            response.compute_group(group, response_group, ig, workspace);
 
             if (!random_effects_compute(group, G_inv, workspace))
             {

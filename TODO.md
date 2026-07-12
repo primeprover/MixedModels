@@ -16,14 +16,14 @@ work within the most suitable section.
 
 ## Next: normal response separation and regression protection
 
-5. [ ] Split `response.cpp`/`response.hpp` into a small shared response base,
+5. [x] Split `response.cpp`/`response.hpp` into a small shared response base,
    separate `HomoNormalResponse` and `HeteroNormalResponse` headers and
    implementations, and a response-factory implementation.
-6. [ ] Restore an independent scalar-variance homo-normal fast path.  It must
-   not allocate or update per-observation `eta`/`inv_resid_var` vectors merely
-   to match the heteroscedastic interface.
-7. [ ] Keep the homo- and heteroscedastic-normal group calculations separate
-   enough that either remains a useful regression check for the other.
+6. [x] Restore an independent scalar-variance homo-normal fast path that does
+   not allocate or update per-observation `eta`/`inv_resid_var` vectors.
+7. [x] Keep the homo- and heteroscedastic-normal group calculations separate so
+   the homo path remains a useful regression check and the hetero path stays
+   naturally per-observation.
 8. [ ] Add repeatable small-data regression tests for homo- and
    heteroscedastic-normal likelihoods, beta estimates, parameter-count
    validation, and the homo-normal fast path.
