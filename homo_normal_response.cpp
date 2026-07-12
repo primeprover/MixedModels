@@ -34,6 +34,11 @@ int HomoNormalResponse::parameter_count() const
     return 1;
 }
 
+int HomoNormalResponse::fixed_effect_dimension() const
+{
+    return groups.empty() ? 0 : groups.front().X.cols();
+}
+
 void HomoNormalResponse::initialise_working()
 {
     // No per-observation working buffers needed for the homo-normal scalar path.
@@ -79,7 +84,7 @@ void HomoNormalResponse::compute_group(
     const GroupData& random_effects_group,
     const ResponseGroupData& response_group,
     int group_index,
-    GroupWorkspace& ws) const
+    ResponseGroupWorkspace& ws) const
 {
     compute_homo_normal_group(
         random_effects_group,
@@ -116,7 +121,7 @@ void compute_homo_normal_group(
     const ResponseGroupData& response_group,
     double inv_resid_var,
     double log_resid_variance,
-    GroupWorkspace& ws)
+    ResponseGroupWorkspace& ws)
 {
     ws.RinvZ = random_effects_group.Z;
     ws.RinvX = response_group.X;

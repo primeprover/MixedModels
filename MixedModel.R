@@ -14,7 +14,8 @@ tryCatch(
 
 
 prepare_mixed_data <- function(formula, random, var_pred = NULL, data,
-                               residual_variance_penalty_weight = 0) {
+                               residual_variance_penalty_weight = 0,
+                               response_type = NULL) {
   if (!is.numeric(residual_variance_penalty_weight) ||
       length(residual_variance_penalty_weight) != 1 ||
       !is.finite(residual_variance_penalty_weight) ||
@@ -28,9 +29,15 @@ prepare_mixed_data <- function(formula, random, var_pred = NULL, data,
   if (!is.call(random_rhs) || random_rhs[[1]] != as.name("|")) {
     stop("random formula must be of the form '~ <effects> | <group>'")
   }
-  heteroscedastic <- FALSE
-  if (!is.null(var_pred)) {
-    heteroscedastic <- TRUE
+  if (is.null(response_type)) {
+    response_type <- if (!is.null(var_pred)) "hetero_normal" else "homo_normal"
+  } else {
+    response_type <- match.arg(response_type, c("homo_normal", "hetero_normal"))
+  }
+
+  heteroscedastic <- identical(response_type, "hetero_normal")
+  W <- NULL
+  if (heteroscedastic) {
     W <- model.matrix(var_pred, data)
   }
   random_effects_expr <- random_rhs[[2]]
@@ -94,6 +101,11 @@ prepare_mixed_data <- function(formula, random, var_pred = NULL, data,
       )
     })
   }
+  response_spec <- list(type = response_type)
+  if (heteroscedastic) {
+    response_spec$var_pred <- var_pred
+  }
+
   list(
     formula = formula,
     random = random,
@@ -112,6 +124,7 @@ prepare_mixed_data <- function(formula, random, var_pred = NULL, data,
     lo_sigma = lo_sigma,
     hi_sigma = hi_sigma,
     heteroscedastic = heteroscedastic,
+    response_spec = response_spec,
     residual_variance_penalty_weight = residual_variance_penalty_weight
   )
 }

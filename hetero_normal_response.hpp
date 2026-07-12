@@ -8,7 +8,7 @@ void compute_hetero_normal_group(
     const ResponseGroupData& response_group,
     const VectorXd& inv_resid_var,
     const VectorXd& eta,
-    GroupWorkspace& ws);
+    ResponseGroupWorkspace& ws);
 
 struct HeteroResponseWorkingGroup {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -23,6 +23,7 @@ public:
 
     void initialise_from_prepared(const Rcpp::List& prepared) override;
     int parameter_count() const override;
+    int fixed_effect_dimension() const override;
     void initialise_working() override;
     void update_working(const VectorXd& parameters) const override;
     void update_working_from_theta(
@@ -38,7 +39,7 @@ public:
     void compute_group(const GroupData& random_effects_group,
                        const ResponseGroupData& response_group,
                        int group_index,
-                       GroupWorkspace& ws) const override;
+                       ResponseGroupWorkspace& ws) const override;
     VectorXd compute_beta_hat(
         const PreparedModel& prepared,
         const MatrixXd& G_inv,

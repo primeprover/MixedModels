@@ -7,7 +7,7 @@ void compute_homo_normal_group(
     const ResponseGroupData& response_group,
     double inv_resid_var,
     double log_resid_variance,
-    GroupWorkspace& ws);
+    ResponseGroupWorkspace& ws);
 
 class HomoNormalResponse : public ResponseModel
 {
@@ -16,6 +16,7 @@ public:
 
     void initialise_from_prepared(const Rcpp::List& prepared) override;
     int parameter_count() const override;
+    int fixed_effect_dimension() const override;
     void initialise_working() override;
     void update_working(const VectorXd& parameters) const override;
     void update_working_from_theta(
@@ -31,7 +32,7 @@ public:
     void compute_group(const GroupData& random_effects_group,
                        const ResponseGroupData& response_group,
                        int group_index,
-                       GroupWorkspace& ws) const override;
+                       ResponseGroupWorkspace& ws) const override;
     VectorXd compute_beta_hat(
         const PreparedModel& prepared,
         const MatrixXd& G_inv,

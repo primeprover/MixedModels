@@ -37,30 +37,31 @@ struct PreparedModel {
   ~PreparedModel();
 };
 
-struct GroupWorkspace {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+struct ResponseGroupWorkspace {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    // Response model outputs
-    MatrixXd RinvZ;
-    MatrixXd RinvX;
-    VectorXd Rinvy;
+  MatrixXd RinvZ;
+  MatrixXd RinvX;
+  VectorXd Rinvy;
 
-    // Random effects intermediates
-    MatrixXd ZtRinvZ;
-    MatrixXd ZtRinvX;
-    VectorXd ZtRinvy;
+  double logdetR = 0.0;
+};
 
-    MatrixXd K;
+struct RandomEffectsIntegrationWorkspace {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    MatrixXd KinvZtRinvX;
-    VectorXd KinvZtRinvy;
+  MatrixXd ZtRinvZ;
+  MatrixXd ZtRinvX;
+  VectorXd ZtRinvy;
 
-    // Final outputs
-    MatrixXd VinvX;
-    VectorXd Vinvy;
+  MatrixXd K;
+  MatrixXd KinvZtRinvX;
+  VectorXd KinvZtRinvy;
 
-    double logdetR = 0.0;
-    double logdetK = 0.0;
+  MatrixXd VinvX;
+  VectorXd Vinvy;
 
-    Eigen::LLT<MatrixXd> llt;
+  double logdetK = 0.0;
+
+  Eigen::LLT<MatrixXd> llt;
 };

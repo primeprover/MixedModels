@@ -35,14 +35,34 @@ inline RandomEffectsSystem build_random_effects_system(
   return system;
 }
 
+inline void random_effects_begin(
+    const GroupData& group,
+    const ResponseGroupWorkspace& response_workspace,
+    RandomEffectsIntegrationWorkspace& ws)
+{
+    ws.ZtRinvZ.noalias() = group.Z.transpose() * response_workspace.RinvZ;
+    ws.ZtRinvX.noalias() = group.Z.transpose() * response_workspace.RinvX;
+    ws.ZtRinvy.noalias() = group.Z.transpose() * response_workspace.Rinvy;
+}
+
+inline void random_effects_finalize(
+    const Eigen::LLT<MatrixXd>& llt,
+    const ResponseGroupWorkspace& response_workspace,
+    RandomEffectsIntegrationWorkspace& ws)
+{
+    ws.KinvZtRinvX = llt.solve(ws.ZtRinvX);
+    ws.KinvZtRinvy = llt.solve(ws.ZtRinvy);
+    ws.VinvX.noalias() = response_workspace.RinvX - response_workspace.RinvZ * ws.KinvZtRinvX;
+    ws.Vinvy.noalias() = response_workspace.Rinvy - response_workspace.RinvZ * ws.KinvZtRinvy;
+}
+
 inline bool random_effects_compute(
     const GroupData& group,
     const MatrixXd& G_inv,
-    GroupWorkspace& ws)
+    const ResponseGroupWorkspace& response_workspace,
+    RandomEffectsIntegrationWorkspace& ws)
 {
-    ws.ZtRinvZ.noalias() = group.Z.transpose() * ws.RinvZ;
-    ws.ZtRinvX.noalias() = group.Z.transpose() * ws.RinvX;
-    ws.ZtRinvy.noalias() = group.Z.transpose() * ws.Rinvy;
+    random_effects_begin(group, response_workspace, ws);
 
     ws.K = G_inv;
     ws.K.noalias() += ws.ZtRinvZ;
@@ -52,11 +72,7 @@ inline bool random_effects_compute(
         return false;
 
     ws.logdetK = 2.0 * ws.llt.matrixLLT().diagonal().array().log().sum();
-    ws.KinvZtRinvX = ws.llt.solve(ws.ZtRinvX);
-    ws.KinvZtRinvy = ws.llt.solve(ws.ZtRinvy);
-
-    ws.VinvX.noalias() = ws.RinvX - ws.RinvZ * ws.KinvZtRinvX;
-    ws.Vinvy.noalias() = ws.Rinvy - ws.RinvZ * ws.KinvZtRinvy;
+    random_effects_finalize(ws.llt, response_workspace, ws);
 
     return true;
 }

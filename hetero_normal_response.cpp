@@ -33,6 +33,11 @@ int HeteroNormalResponse::parameter_count() const
     return groups.empty() ? 0 : groups.front().W.cols();
 }
 
+int HeteroNormalResponse::fixed_effect_dimension() const
+{
+    return groups.empty() ? 0 : groups.front().X.cols();
+}
+
 void HeteroNormalResponse::initialise_working()
 {
     working_groups_.resize(groups.size());
@@ -87,7 +92,7 @@ void HeteroNormalResponse::compute_group(
     const GroupData& random_effects_group,
     const ResponseGroupData& response_group,
     int group_index,
-    GroupWorkspace& ws) const
+    ResponseGroupWorkspace& ws) const
 {
     const auto& working_group = working_groups_[group_index];
     compute_hetero_normal_group(
@@ -125,7 +130,7 @@ void compute_hetero_normal_group(
     const ResponseGroupData& response_group,
     const VectorXd& inv_resid_var,
     const VectorXd& eta,
-    GroupWorkspace& ws)
+    ResponseGroupWorkspace& ws)
 {
     ws.RinvZ = random_effects_group.Z;
     ws.RinvX = response_group.X;

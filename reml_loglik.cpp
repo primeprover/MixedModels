@@ -118,7 +118,8 @@ bool accumulate_groups_response(
     Eigen::setNbThreads(1);
 
     const auto& groups = model.groups;
-    const int p = response.groups.front().X.cols();
+    const int p = response.fixed_effect_dimension();
+    ConditionalContribution contribution(p);
 
     std::atomic<bool> bad(false);
 
@@ -126,53 +127,118 @@ bool accumulate_groups_response(
 #pragma omp parallel
 #endif
     {
-        MatrixXd XtVinvX_local = MatrixXd::Zero(p, p);
-        VectorXd XtVinvy_local = VectorXd::Zero(p);
+        ConditionalContribution local_contribution(p);
 
-        double logdetV_local = 0.0;
-        double quad_local = 0.0;
-
-        GroupWorkspace workspace;
+        ResponseGroupWorkspace response_workspace;
+        RandomEffectsIntegrationWorkspace integration_workspace;
 
 #ifdef _OPENMP
 #pragma omp for schedule(guided)
 #endif
         for (int ig = 0; ig < (int)groups.size(); ++ig) {
-
             const auto& group = groups[ig];
             const auto& response_group = response.groups[ig];
 
-            response.compute_group(group, response_group, ig, workspace);
+            response.compute_group(group, response_group, ig, response_workspace);
 
-            if (!random_effects_compute(group, G_inv, workspace))
-            {
+            if (!random_effects_compute(group, G_inv, response_workspace, integration_workspace)) {
                 bad.store(true, std::memory_order_relaxed);
                 continue;
             }
-            
-            // ----------------------------------------------------
-            // accumulate
-            // ----------------------------------------------------
 
-
-            XtVinvX_local.noalias() += response_group.X.transpose() * workspace.VinvX;
-            XtVinvy_local.noalias() += response_group.X.transpose() * workspace.Vinvy;
-
-            quad_local += response_group.y.dot(workspace.Vinvy);
-
-            // group contribution:
-            // log|R| + log|G^{-1}+Z'R^{-1}Z|
-            logdetV_local += workspace.logdetR + workspace.logdetK;
+            local_contribution.add_group_contribution(response_group, response_workspace, integration_workspace);
         }
 
 #ifdef _OPENMP
 #pragma omp critical
 #endif
         {
-            XtVinvX += XtVinvX_local;
-            XtVinvy += XtVinvy_local;
-            logdetV += logdetV_local;
-            quad += quad_local;
+            contribution.merge_from(local_contribution);
+        }
+    }
+
+    XtVinvX = contribution.XtVinvX;
+    XtVinvy = contribution.XtVinvy;
+    logdetV = contribution.logdetV;
+    quad = contribution.quad;
+
+    return !bad.load();
+}
+
+bool accumulate_conditional_contributions(
+    const PreparedModel& model,
+    const MatrixXd& G_inv,
+    ConditionalContribution& contribution)
+{
+    if (model.responses.empty())
+        return false;
+
+    const int p = model.responses.front()->fixed_effect_dimension();
+    if (p <= 0)
+        return false;
+
+    for (const auto& response_ptr : model.responses) {
+        if (response_ptr->fixed_effect_dimension() != p)
+            return false;
+    }
+
+    contribution = ConditionalContribution(p);
+
+    const auto& groups = model.groups;
+    std::atomic<bool> bad(false);
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        ConditionalContribution local_contribution(p);
+        std::vector<ResponseGroupWorkspace> response_workspaces(model.responses.size());
+        std::vector<RandomEffectsIntegrationWorkspace> integration_workspaces(model.responses.size());
+
+#ifdef _OPENMP
+#pragma omp for schedule(guided)
+#endif
+        for (int ig = 0; ig < (int)groups.size(); ++ig) {
+            const auto& group = groups[ig];
+            RandomEffectsIntegrationWorkspace shared_integration;
+            shared_integration.ZtRinvZ.setZero(group.Z.cols(), group.Z.cols());
+            shared_integration.ZtRinvX.setZero(group.Z.cols(), p);
+            shared_integration.ZtRinvy.setZero(group.Z.cols());
+
+            for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+                const ResponseModel& response = *model.responses[ir];
+                response.compute_group(group, response.groups[ig], ig, response_workspaces[ir]);
+                random_effects_begin(group, response_workspaces[ir], integration_workspaces[ir]);
+                shared_integration.ZtRinvZ.noalias() += integration_workspaces[ir].ZtRinvZ;
+                shared_integration.ZtRinvX.noalias() += integration_workspaces[ir].ZtRinvX;
+                shared_integration.ZtRinvy.noalias() += integration_workspaces[ir].ZtRinvy;
+            }
+
+            shared_integration.K = G_inv;
+            shared_integration.K.noalias() += shared_integration.ZtRinvZ;
+            shared_integration.llt.compute(shared_integration.K);
+            if (shared_integration.llt.info() != Eigen::Success) {
+                bad.store(true, std::memory_order_relaxed);
+                continue;
+            }
+
+            shared_integration.logdetK = 2.0 * shared_integration.llt.matrixLLT().diagonal().array().log().sum();
+
+            for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+                const ResponseModel& response = *model.responses[ir];
+                const ResponseGroupData& response_group = response.groups[ig];
+                RandomEffectsIntegrationWorkspace& integration_workspace = integration_workspaces[ir];
+                random_effects_finalize(shared_integration.llt, response_workspaces[ir], integration_workspace);
+                integration_workspace.logdetK = shared_integration.logdetK;
+                local_contribution.add_group_contribution(response_group, response_workspaces[ir], integration_workspace);
+            }
+        }
+
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+        {
+            contribution.merge_from(local_contribution);
         }
     }
 
@@ -193,58 +259,68 @@ Rcpp::List reml_loglik_cpp_impl(
   PreparedModel& model = *model_xptr;
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  if (model.responses.size() != 1) {
-    Rcpp::stop("The current REML accumulator supports one response.");
-  }
-
-  ResponseModel& response = *model.responses.front();
-  const int p = response.groups.front().X.cols();
   const int q = model.q;
   const int n_corr = model.n_corr;
   const int response_offset = q + n_corr;
 
-  if (theta_raw.size() != response_offset + response.parameter_count()) {
-    Rcpp::stop("theta has the wrong number of response parameters.");
+  if (model.responses.empty()) {
+    Rcpp::stop("The current REML accumulator requires at least one response.");
+  }
+  int p = 0;
+  for (const auto& response_ptr : model.responses) {
+    const ResponseModel& response = *response_ptr;
+    if (theta_raw.size() != response_offset + response.parameter_count()) {
+      Rcpp::stop("theta has the wrong number of response parameters.");
+    }
+    if (p == 0) {
+      p = response.fixed_effect_dimension();
+    } else if (response.fixed_effect_dimension() != p) {
+      Rcpp::stop("The current multi-response accumulator requires responses with the same fixed-effect dimension.");
+    }
   }
 
   VectorXd log_sds = theta_raw.head(q);
   VectorXd corrs_unconstrained = theta_raw.segment(q, n_corr);
-  response.update_working_from_theta(theta_raw, q, n_corr);
+  for (const auto& response_ptr : model.responses) {
+    ResponseModel& response = *response_ptr;
+    response.update_working_from_theta(theta_raw, q, n_corr);
+    if (!response.parameters_are_valid_for_theta(theta_raw, q, n_corr))
+      return bad_result();
+  }
 
   VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
   if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
-  if (!response.parameters_are_valid_for_theta(theta_raw, q, n_corr))
-    return bad_result();
 
   RandomEffectsSystem random_effects = build_random_effects_system(
       q, log_sds, corrs_unconstrained);
   if (random_effects.G_inv.size() == 0) return bad_result();
 
-  double penalty = compute_penalty(model, log_sds, response);
+  double penalty = 0.0;
+  for (const auto& response_ptr : model.responses) {
+    penalty += compute_penalty(model, log_sds, *response_ptr);
+  }
 
   auto t_after_build = std::chrono::high_resolution_clock::now();
   double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
 
-  MatrixXd XtVinvX = MatrixXd::Zero(p, p);
-  VectorXd XtVinvy = VectorXd::Zero(p);
-  double logdetV = 0.0;
-  double quad = 0.0;
-  bool success = accumulate_groups_response(
-      model, response, random_effects.G_inv, XtVinvX, XtVinvy, logdetV, quad);
+  ConditionalContribution contribution(p);
+  bool success = accumulate_conditional_contributions(
+      model, random_effects.G_inv, contribution);
   if (!success) return bad_result();
 
   auto t_after_groups = std::chrono::high_resolution_clock::now();
   double t_groups = std::chrono::duration<double>(t_after_groups - t_after_build).count();
 
-  logdetV += static_cast<double>(model.groups.size()) * random_effects.logdetG;
+  double logdetV = contribution.logdetV +
+      static_cast<double>(model.groups.size()) * random_effects.logdetG;
 
-  VectorXd beta_hat = solve_fixed_effects(XtVinvX, XtVinvy);
-  double quad_res = std::max(0.0, quad - beta_hat.transpose() * XtVinvy);
+  VectorXd beta_hat = solve_fixed_effects(contribution.XtVinvX, contribution.XtVinvy);
+  double quad_res = std::max(0.0, contribution.quad - beta_hat.transpose() * contribution.XtVinvy);
 
-  const int n = total_observation_count(response.groups);
+  const int n = total_observation_count(model.responses.front()->groups);
   double ll = -0.5 * (
       logdetV +
-      logdet_from_cholesky(XtVinvX) +
+      logdet_from_cholesky(contribution.XtVinvX) +
       quad_res +
       (n - p) * std::log(2.0 * M_PI));
 
@@ -273,14 +349,25 @@ VectorXd compute_beta_hat_cpp(
     Rcpp::XPtr<PreparedModel> model
 ) {
     PreparedModel& prepared = *model;
-    if (prepared.responses.size() != 1)
-      Rcpp::stop("The current beta calculation supports one response.");
+    if (prepared.responses.empty())
+      Rcpp::stop("The current beta calculation requires at least one response.");
 
-    ResponseModel& response = *prepared.responses.front();
     const int response_offset = prepared.q + prepared.n_corr;
-    if (theta.size() != response_offset + response.parameter_count())
-      Rcpp::stop("theta has the wrong number of response parameters.");
-    response.update_working_from_theta(theta, prepared.q, prepared.n_corr);
+    int p = 0;
+    for (const auto& response_ptr : prepared.responses) {
+      const ResponseModel& response = *response_ptr;
+      if (theta.size() != response_offset + response.parameter_count())
+        Rcpp::stop("theta has the wrong number of response parameters.");
+      if (p == 0) {
+        p = response.fixed_effect_dimension();
+      } else if (response.fixed_effect_dimension() != p) {
+        Rcpp::stop("The current multi-response accumulator requires responses with the same fixed-effect dimension.");
+      }
+    }
+    for (const auto& response_ptr : prepared.responses) {
+      ResponseModel& response = *response_ptr;
+      response.update_working_from_theta(theta, prepared.q, prepared.n_corr);
+    }
 
     MatrixXd L = build_cholesky(theta, prepared.q);
     MatrixXd G = L * L.transpose();
@@ -290,5 +377,12 @@ VectorXd compute_beta_hat_cpp(
       Rcpp::stop("Could not factor random-effects covariance matrix.");
     MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(prepared.q, prepared.q));
 
-    return response.compute_beta_hat(prepared, G_inv, theta);
+    ConditionalContribution contribution(p);
+    if (!accumulate_conditional_contributions(prepared, G_inv, contribution))
+      Rcpp::stop("Could not accumulate response groups.");
+
+    Eigen::LLT<MatrixXd> llt_XtVinvX(contribution.XtVinvX);
+    if (llt_XtVinvX.info() != Eigen::Success)
+      Rcpp::stop("Could not factor fixed-effects information matrix.");
+    return llt_XtVinvX.solve(contribution.XtVinvy);
 }

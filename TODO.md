@@ -32,14 +32,14 @@ work within the most suitable section.
 
 ## Response specification and construction
 
-10. [ ] Replace the `prepared["heteroscedastic"]` selection in
+10. [x] Replace the `prepared["heteroscedastic"]` selection in
     `init_model_cpp()` with a formal R response specification.  Initially
     default to `homo_normal`; retain the current `var_pred` shortcut that
     selects `hetero_normal` when no explicit type is supplied.
-11. [ ] Move response-type parsing and construction to a response factory so
+11. [x] Move response-type parsing and construction to a response factory so
     `init_model_cpp()` creates a response from a specification without an
     expanding response-type `if`/`switch` block.
-12. [ ] Define an R-side response specification object: type, outcome/fixed
+12. [x] Define an R-side response specification object: type, outcome/fixed
     effect inputs, random-effects mapping, and response-specific options.
     Keep R-to-C++ conversion at the response factory/constructor boundary.
 13. [ ] Move response parameter initial values, bounds, names, validation, and
@@ -50,20 +50,32 @@ work within the most suitable section.
 
 ## Conditional contributions and Gaussian random-effects kernel
 
-14. [ ] Introduce a response-independent *conditional contribution* contract.
+14. [x] Introduce a response-independent *conditional contribution* contract.
     For each response and group it represents information conditional on the
     group's random effects; it must be possible to combine contributions from
     independent responses before integrating over shared random effects.
-15. [ ] Add a response-independent merge operation for conditional
+14.1. [x] Define a shared `ConditionalContribution` container in the response
+      base layer for the fixed-effect information matrix, response-specific
+      quadratic form, and log-determinant components.
+14.2. [x] Generalise the container so it can be merged across multiple
+      responses and reused by the current multi-response accumulator.
+15. [x] Add a response-independent merge operation for conditional
     contributions from all outcomes in one group, then pass the merged result
     to the random-effects integration kernel.  Do not marginalise each
     response separately when they share random effects.
-16. [ ] Split `GroupWorkspace` into a normal/Gaussian workspace and a
-    random-effects integration workspace.  Rename the existing structure to
-    make its `R^-1`, log-determinant, Cholesky, and `V^-1` assumptions explicit.
-17. [ ] Extract the current exact normal-response random-effects calculation
-    into a `GaussianRandomEffectsKernel`, used by both normal responses but
-    not imposed as the general response interface.
+15.1. [x] Use the shared conditional-contribution container in the current
+      single-response REML loop as the unit of accumulation.
+15.2. [x] Replace the current single-response-only accumulation path with a
+      true multi-response merge step that combines per-response contribution
+      blocks before the shared random-effects integration kernel is applied.
+16. [x] Split `GroupWorkspace` into a response-side workspace and a
+    random-effects integration workspace. Keep the current `R^-1`,
+    log-determinant, Cholesky, and `V^-1` assumptions explicit rather than
+    overloading one structure for both roles.
+17. [x] Keep the homo-normal and hetero-normal response paths fully separate
+    as response implementations. Extract only the shared random-effects
+    integration logic that applies to any response once additional response
+    types are added, rather than introducing a common normal-response kernel.
 18. [ ] Add tests for merging conditional contributions from two independent
     responses sharing random effects, before enabling multi-response fitting.
 
