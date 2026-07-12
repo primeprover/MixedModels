@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <limits>
 
 
 // [[Rcpp::depends(RcppEigen)]]
@@ -40,6 +41,28 @@ std::vector<GroupData> extract_groups(const Rcpp::List& prepared) {
 }
 
 PreparedModel::~PreparedModel() = default;
+
+namespace {
+
+VectorXd solve_fixed_effects(
+    const MatrixXd& XtVinvX,
+    const VectorXd& XtVinvy)
+{
+  Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
+  if (llt_XtVinvX.info() != Eigen::Success)
+    Rcpp::stop("Could not factor fixed-effects information matrix.");
+  return llt_XtVinvX.solve(XtVinvy);
+}
+
+double logdet_from_cholesky(const MatrixXd& XtVinvX)
+{
+  Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
+  if (llt_XtVinvX.info() != Eigen::Success)
+    Rcpp::stop("Could not factor fixed-effects information matrix.");
+  return 2.0 * llt_XtVinvX.matrixLLT().diagonal().array().log().sum();
+}
+
+} // namespace
 
 // [[Rcpp::export]]
 Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
@@ -163,104 +186,71 @@ bool accumulate_groups_response(
 // [[Rcpp::export]]
 Rcpp::List reml_loglik_cpp_impl(
     Rcpp::XPtr<PreparedModel> model_xptr,
-    const Eigen::VectorXd& theta,
+    const Eigen::VectorXd& theta_raw,
     bool return_penalty,
     bool return_timing
 ) {
   PreparedModel& model = *model_xptr;
-  // Convert theta to Eigen vector
   auto t_start = std::chrono::high_resolution_clock::now();
-  //const VectorXd& theta = theta_r;
-  const auto& groups = model.groups;
+
   if (model.responses.size() != 1) {
     Rcpp::stop("The current REML accumulator supports one response.");
   }
+
   ResponseModel& response = *model.responses.front();
   const int p = response.groups.front().X.cols();
-  int q = model.q;
-  int n_corr = model.n_corr;
+  const int q = model.q;
+  const int n_corr = model.n_corr;
   const int response_offset = q + n_corr;
-  if (theta.size() != response_offset + response.parameter_count()) {
+
+  if (theta_raw.size() != response_offset + response.parameter_count()) {
     Rcpp::stop("theta has the wrong number of response parameters.");
   }
-  VectorXd log_sds = theta.head(q);
-  VectorXd corrs_unconstrained = theta.segment(q, n_corr);
-  VectorXd response_parameters = theta.segment(
-      response_offset, response.parameter_count());
-  response.update_working(response_parameters);
-  //double lo_sigma = model.lo_sigma;
-  //double hi_sigma = model.hi_sigma;
 
-  //int n_groups = groups.size();
-  
-  // Extract parameters from theta
-  
-  // Parameter validation
+  VectorXd log_sds = theta_raw.head(q);
+  VectorXd corrs_unconstrained = theta_raw.segment(q, n_corr);
+  response.update_working_from_theta(theta_raw, q, n_corr);
+
   VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
   if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
-  if (!response.parameters_are_valid(response_parameters))
+  if (!response.parameters_are_valid_for_theta(theta_raw, q, n_corr))
     return bad_result();
-  
-  // Build Cholesky factor L and compute G = L L'
-  MatrixXd L = build_cholesky(theta, q);
-  MatrixXd G = L * L.transpose();
-  
-  // Add jitter for numerical stability
-  G.diagonal().array() += 1e-8;
-  
-  // Compute G_inv using Eigen's LLT Cholesky solver (more stable than direct inversion)
-  Eigen::LLT<MatrixXd> llt_G(G);
-  if (llt_G.info() != Eigen::Success) return bad_result();
-  MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(q, q));
-  
-  // Compute log-determinant of G from Cholesky factor
-  double logdetG = 2.0 * llt_G.matrixLLT().diagonal().array().log().sum();
-  
-  // Calculate random effects penalties for flat regions and extreme values
+
+  RandomEffectsSystem random_effects = build_random_effects_system(
+      q, log_sds, corrs_unconstrained);
+  if (random_effects.G_inv.size() == 0) return bad_result();
+
   double penalty = compute_penalty(model, log_sds, response);
 
   auto t_after_build = std::chrono::high_resolution_clock::now();
   double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
-  
-  // Accumulate sufficient statistics across groups
+
   MatrixXd XtVinvX = MatrixXd::Zero(p, p);
   VectorXd XtVinvy = VectorXd::Zero(p);
   double logdetV = 0.0;
   double quad = 0.0;
-
-  auto t_loop_start = std::chrono::high_resolution_clock::now();
   bool success = accumulate_groups_response(
-      model, response, G_inv, XtVinvX, XtVinvy, logdetV, quad);
+      model, response, random_effects.G_inv, XtVinvX, XtVinvy, logdetV, quad);
   if (!success) return bad_result();
+
   auto t_after_groups = std::chrono::high_resolution_clock::now();
-  double t_groups = std::chrono::duration<double>(t_after_groups - t_loop_start).count();
-  
-  //if (!model.heteroscedastic)
-    logdetV += groups.size() * logdetG;
-  
-  // Compute XtVinvX^{-1} using Cholesky
-  Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
-  if (llt_XtVinvX.info() != Eigen::Success) return bad_result();
-  double logdet_XtVinvX = 2.0 * llt_XtVinvX.matrixLLT().diagonal().array().log().sum();
-  
-  // Solve for beta_hat
-  VectorXd beta_hat = llt_XtVinvX.solve(XtVinvy);
-  
-  // Compute quadratic residual
-  double quad_res = 0.0;
-  
-  quad_res = quad - beta_hat.transpose() * XtVinvy;
-  quad_res = std::max(0.0, quad_res);
-  
-  // Compute REML log-likelihood
-  int n = 0;
-  for (const auto& group : response.groups) n += group.y.size();
-  double ll = -0.5 * (logdetV + logdet_XtVinvX + quad_res + (n - p) * std::log(2.0 * M_PI));
-  
+  double t_groups = std::chrono::duration<double>(t_after_groups - t_after_build).count();
+
+  logdetV += static_cast<double>(model.groups.size()) * random_effects.logdetG;
+
+  VectorXd beta_hat = solve_fixed_effects(XtVinvX, XtVinvy);
+  double quad_res = std::max(0.0, quad - beta_hat.transpose() * XtVinvy);
+
+  const int n = total_observation_count(response.groups);
+  double ll = -0.5 * (
+      logdetV +
+      logdet_from_cholesky(XtVinvX) +
+      quad_res +
+      (n - p) * std::log(2.0 * M_PI));
+
   auto t_after_finalize = std::chrono::high_resolution_clock::now();
   double t_finalize = std::chrono::duration<double>(t_after_finalize - t_after_groups).count();
 
-  // Return results
   Rcpp::List result;
   result["logLik_unpenalized"] = ll;
   result["logLik_penalized"] = ll - penalty;
@@ -270,10 +260,10 @@ Rcpp::List reml_loglik_cpp_impl(
       Rcpp::Named("build_G") = t_build,
       Rcpp::Named("groups") = t_groups,
       Rcpp::Named("finalize") = t_finalize,
-      Rcpp::Named("total") = 0 + t_build + t_groups + t_finalize
+      Rcpp::Named("total") = t_build + t_groups + t_finalize
     );
   }
-  
+
   return result;
 }
 
@@ -290,8 +280,7 @@ VectorXd compute_beta_hat_cpp(
     const int response_offset = prepared.q + prepared.n_corr;
     if (theta.size() != response_offset + response.parameter_count())
       Rcpp::stop("theta has the wrong number of response parameters.");
-    response.update_working(theta.segment(
-        response_offset, response.parameter_count()));
+    response.update_working_from_theta(theta, prepared.q, prepared.n_corr);
 
     MatrixXd L = build_cholesky(theta, prepared.q);
     MatrixXd G = L * L.transpose();

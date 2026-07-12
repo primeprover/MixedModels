@@ -52,9 +52,27 @@ void HeteroNormalResponse::update_working(const VectorXd& parameters) const
     }
 }
 
+void HeteroNormalResponse::update_working_from_theta(
+    const VectorXd& theta,
+    int q,
+    int n_corr) const
+{
+    const int response_offset = q + n_corr;
+    update_working(theta.segment(response_offset, parameter_count()));
+}
+
 bool HeteroNormalResponse::parameters_are_valid(const VectorXd& parameters) const
 {
     return parameters.size() == parameter_count();
+}
+
+bool HeteroNormalResponse::parameters_are_valid_for_theta(
+    const VectorXd& theta,
+    int q,
+    int n_corr) const
+{
+    const int response_offset = q + n_corr;
+    return parameters_are_valid(theta.segment(response_offset, parameter_count()));
 }
 
 double HeteroNormalResponse::residual_variance_penalty() const
@@ -85,8 +103,7 @@ VectorXd HeteroNormalResponse::compute_beta_hat(
     const MatrixXd& G_inv,
     const VectorXd& theta) const
 {
-    const int response_offset = prepared.q + prepared.n_corr;
-    update_working(theta.segment(response_offset, parameter_count()));
+    update_working_from_theta(theta, prepared.q, prepared.n_corr);
 
     MatrixXd XtVinvX = MatrixXd::Zero(groups.front().X.cols(), groups.front().X.cols());
     VectorXd XtVinvy = VectorXd::Zero(groups.front().X.cols());

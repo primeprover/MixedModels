@@ -45,7 +45,15 @@ public:
     virtual int parameter_count() const = 0;
     virtual void initialise_working() = 0;
     virtual void update_working(const VectorXd& parameters) const = 0;
+    virtual void update_working_from_theta(
+        const VectorXd& theta,
+        int q,
+        int n_corr) const = 0;
     virtual bool parameters_are_valid(const VectorXd& parameters) const = 0;
+    virtual bool parameters_are_valid_for_theta(
+        const VectorXd& theta,
+        int q,
+        int n_corr) const = 0;
     virtual double residual_variance_penalty() const = 0;
     virtual void compute_group(
         const GroupData& random_effects_group,
