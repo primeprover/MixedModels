@@ -24,14 +24,18 @@ public:
     void initialise_from_prepared(const Rcpp::List& prepared) override;
     int parameter_count() const override;
     void initialise_working() override;
-    void update_working(const VectorXd& parameters) override;
+    void update_working(const VectorXd& parameters) const override;
     bool parameters_are_valid(const VectorXd& parameters) const override;
     double residual_variance_penalty() const override;
     void compute_group(const GroupData& random_effects_group,
                        const ResponseGroupData& response_group,
                        int group_index,
                        GroupWorkspace& ws) const override;
+    VectorXd compute_beta_hat(
+        const PreparedModel& prepared,
+        const MatrixXd& G_inv,
+        const VectorXd& theta) const override;
 
 private:
-    std::vector<HeteroResponseWorkingGroup> working_groups_;
+    mutable std::vector<HeteroResponseWorkingGroup> working_groups_;
 };

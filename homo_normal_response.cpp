@@ -1,6 +1,8 @@
 // [[Rcpp::depends(RcppEigen)]]
 
 #include "homo_normal_response.hpp"
+#include "covariance_utils.hpp"
+#include "random_effects_utils.hpp"
 #include <cmath>
 #include <limits>
 
@@ -37,7 +39,7 @@ void HomoNormalResponse::initialise_working()
     // No per-observation working buffers needed for the homo-normal scalar path.
 }
 
-void HomoNormalResponse::update_working(const VectorXd& parameters)
+void HomoNormalResponse::update_working(const VectorXd& parameters) const
 {
     log_resid_variance_ = parameters(0);
     inv_resid_var_ = std::exp(-log_resid_variance_);
@@ -67,6 +69,29 @@ void HomoNormalResponse::compute_group(
         inv_resid_var_,
         log_resid_variance_,
         ws);
+}
+
+VectorXd HomoNormalResponse::compute_beta_hat(
+    const PreparedModel& prepared,
+    const MatrixXd& G_inv,
+    const VectorXd& theta) const
+{
+    const int response_offset = prepared.q + prepared.n_corr;
+    update_working(theta.segment(response_offset, parameter_count()));
+
+    MatrixXd XtVinvX = MatrixXd::Zero(groups.front().X.cols(), groups.front().X.cols());
+    VectorXd XtVinvy = VectorXd::Zero(groups.front().X.cols());
+    double logdetV = 0.0;
+    double quad = 0.0;
+
+    if (!accumulate_groups_response(prepared, *this, G_inv, XtVinvX, XtVinvy, logdetV, quad)) {
+        Rcpp::stop("Could not accumulate response groups.");
+    }
+
+    Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
+    if (llt_XtVinvX.info() != Eigen::Success)
+        Rcpp::stop("Could not factor fixed-effects information matrix.");
+    return llt_XtVinvX.solve(XtVinvy);
 }
 
 void compute_homo_normal_group(

@@ -8,6 +8,8 @@
 #include "homo_normal_response.hpp"
 #include "hetero_normal_response.hpp"
 #include "response_factory.hpp"
+#include "covariance_utils.hpp"
+#include "random_effects_utils.hpp"
 #include <cmath>
 #include <vector>
 #include <atomic>
@@ -60,44 +62,6 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
-// Build Cholesky factor L from unconstrained parameters
-// theta layout: [log_sd_1, ..., log_sd_q, corr_uncon_1, ..., corr_uncon_n_corr, log_sigma_resid]
-// Returns L where G = L L' is the random effects covariance matrix
-MatrixXd build_cholesky_cpp(const VectorXd& theta, int q) {
-  // Extract and exponentiate log standard deviations
-  VectorXd log_sds = theta.head(q);
-  VectorXd sds = log_sds.array().exp().matrix();
-  
-  // Number of off-diagonal correlations
-  int n_corr = q * (q - 1) / 2;
-  
-  // Apply tanh to unconstrained correlations to map to [-1, 1]
-  VectorXd corrs_unconstrained = theta.segment(q, n_corr);
-  VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
-  
-  // Build lower-triangular correlation matrix L_corr
-  MatrixXd L_corr = MatrixXd::Zero(q, q);
-  
-  int k = 0;
-  for (int i = 0; i < q; ++i) {
-    double row_prod = 1.0;
-    for (int j = 0; j < i; ++j) {
-      L_corr(i, j) = corrs(k) * row_prod;
-      row_prod *= std::sqrt(1.0 - corrs(k) * corrs(k));
-      k++;
-    }
-    L_corr(i, i) = row_prod;
-  }
-  
-  // Scale rows by standard deviations: L = diag(sds) * L_corr
-  // Using Eigen's row-wise scaling operation
-  for (int i = 0; i < q; ++i) {
-    L_corr.row(i) *= sds(i);
-  }
-  
-  return L_corr;
-}
-
 double compute_penalty(
   const PreparedModel& model,  
   const VectorXd& log_sds,
@@ -116,167 +80,6 @@ double compute_penalty(
       response.residual_variance_penalty();
   //std::cout << "Penalty: " << penalty << " Lo_sigma: " << lo_sigma << " Hi_sigma: " << hi_sigma << std::endl;
   return penalty;
-}
-
-//__attribute__((noinline))
-bool accumulate_groups(
-  const PreparedModel& model,
-  const MatrixXd& G_inv,
-  const double& sigma2,
-  MatrixXd& XtVinvX,
-  VectorXd& XtVinvy,
-  double& logdetV,
-  double& quad
-) {
-  int n_threads = 1;
-  Eigen::setNbThreads(1);
-#ifdef _OPENMP
-  #pragma omp parallel
-  {
-    #pragma omp master
-    n_threads = omp_get_num_threads();
-  }
-#endif
-
-  const auto& groups = model.groups;
-  const auto& response = *model.responses.front();
-
-  // std::vector<MatrixXd> XtVinvX_loc(n_threads, MatrixXd::Zero(model.p, model.p));
-  // std::vector<VectorXd> XtVinvy_loc(n_threads, VectorXd::Zero(model.p));
-  // std::vector<double> logdetV_loc(n_threads, 0.0);
-  // std::vector<double> quad_loc(n_threads, 0.0);
-  std::atomic<bool> bad(false);
-
-  const double inv_sigma2    = 1.0 / sigma2;
-  const double inv_sigma2_sq = inv_sigma2 * inv_sigma2;
-
-  const int p = XtVinvX.rows();
-
-  #ifdef _OPENMP
-  #pragma omp parallel
-  #endif
-  {
-      const int tid =
-  #ifdef _OPENMP
-          omp_get_thread_num();
-  #else
-          0;
-  #endif
-
-      MatrixXd K = G_inv;
-      MatrixXd K_inv_Zix;
-      VectorXd K_inv_Ziy;
-      MatrixXd Vi_inv_X;
-      VectorXd Vi_inv_y;
-
-      MatrixXd XtVinvX_local = MatrixXd::Zero(p, p);
-      VectorXd XtVinvy_local = VectorXd::Zero(p);
-      double   logdetV_local = 0.0;
-      double   quad_local    = 0.0;
-
-      Eigen::LLT<MatrixXd, Eigen::Lower> llt;
-
-  #ifdef _OPENMP
-  #pragma omp for schedule(guided)
-  #endif
-      for (int ig = 0; ig < (int)groups.size(); ++ig) {
-          if (bad.load(std::memory_order_relaxed)) continue;
-
-          const auto& group = groups[ig];
-          const auto& response_group = response.groups[ig];
-
-          K.noalias() = G_inv;
-          K.noalias() += group.ZtZ * inv_sigma2;
-
-          llt.compute(K);
-          if (llt.info() != Eigen::Success) {
-              bad.store(true, std::memory_order_relaxed);
-              continue;
-          }
-
-          const auto& L = llt.matrixLLT();
-          const double logdetK   = 2.0 * L.diagonal().array().log().sum();
-          const double t_logdetV = group.n * std::log(sigma2) + logdetK;
-
-          K_inv_Ziy = llt.solve(response_group.ZtY);
-          K_inv_Zix = llt.solve(response_group.ZtX);
-
-          Vi_inv_y = response_group.y * inv_sigma2;
-          Vi_inv_y.noalias() -= group.Z * K_inv_Ziy * inv_sigma2_sq;
-
-          Vi_inv_X = response_group.X * inv_sigma2;
-          Vi_inv_X.noalias() -= group.Z * K_inv_Zix * inv_sigma2_sq;
-
-          XtVinvX_local.noalias() += response_group.X.transpose() * Vi_inv_X;
-          XtVinvy_local.noalias() += response_group.X.transpose() * Vi_inv_y;
-          logdetV_local += t_logdetV;
-          quad_local    += response_group.y.dot(Vi_inv_y);
-      }
-
-  #ifdef _OPENMP
-  #pragma omp critical
-  #endif
-      {
-          XtVinvX += XtVinvX_local;
-          XtVinvy += XtVinvy_local;
-          logdetV += logdetV_local;
-          quad    += quad_local;
-      }
-  }
-
-
-  if (bad.load(std::memory_order_relaxed)) return false;
-
-  // for (int t = 0; t < n_threads; ++t) {
-  //   XtVinvX += XtVinvX_loc[t];
-  //   XtVinvy += XtVinvy_loc[t];
-  //   logdetV += logdetV_loc[t];
-  //   quad += quad_loc[t];
-  // }
-  return true;
-}
-
-inline bool random_effects_compute(
-    const GroupData& group,
-    const MatrixXd& G_inv,
-    GroupWorkspace& ws)
-{
-    ws.ZtRinvZ.noalias() =
-        group.Z.transpose() * ws.RinvZ;
-
-    ws.ZtRinvX.noalias() =
-        group.Z.transpose() * ws.RinvX;
-
-    ws.ZtRinvy.noalias() =
-        group.Z.transpose() * ws.Rinvy;
-
-    ws.K = G_inv;
-    ws.K.noalias() += ws.ZtRinvZ;
-
-    ws.llt.compute(ws.K);
-
-    if (ws.llt.info() != Eigen::Success)
-      return false;
-
-    ws.logdetK =
-        2.0 *
-        ws.llt.matrixLLT().diagonal().array().log().sum();
-
-    ws.KinvZtRinvX =
-        ws.llt.solve(ws.ZtRinvX);
-
-    ws.KinvZtRinvy =
-        ws.llt.solve(ws.ZtRinvy);
-
-    ws.VinvX.noalias() =
-        ws.RinvX -
-        ws.RinvZ * ws.KinvZtRinvX;
-
-    ws.Vinvy.noalias() =
-        ws.Rinvy -
-        ws.RinvZ * ws.KinvZtRinvy;
-    
-    return true;
 }
 
 bool accumulate_groups_response(
@@ -399,7 +202,7 @@ Rcpp::List reml_loglik_cpp_impl(
     return bad_result();
   
   // Build Cholesky factor L and compute G = L L'
-  MatrixXd L = build_cholesky_cpp(theta, q);
+  MatrixXd L = build_cholesky(theta, q);
   MatrixXd G = L * L.transpose();
   
   // Add jitter for numerical stability
@@ -490,7 +293,7 @@ VectorXd compute_beta_hat_cpp(
     response.update_working(theta.segment(
         response_offset, response.parameter_count()));
 
-    MatrixXd L = build_cholesky_cpp(theta, prepared.q);
+    MatrixXd L = build_cholesky(theta, prepared.q);
     MatrixXd G = L * L.transpose();
     G.diagonal().array() += 1e-8;
     Eigen::LLT<MatrixXd> llt_G(G);
@@ -498,17 +301,5 @@ VectorXd compute_beta_hat_cpp(
       Rcpp::stop("Could not factor random-effects covariance matrix.");
     MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(prepared.q, prepared.q));
 
-    const int p = response.groups.front().X.cols();
-    MatrixXd XtVinvX = MatrixXd::Zero(p, p);
-    VectorXd XtVinvy = VectorXd::Zero(p);
-    double logdetV = 0.0;
-    double quad = 0.0;
-    if (!accumulate_groups_response(
-            prepared, response, G_inv, XtVinvX, XtVinvy, logdetV, quad))
-      Rcpp::stop("Could not accumulate response groups.");
-
-    Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
-    if (llt_XtVinvX.info() != Eigen::Success)
-      Rcpp::stop("Could not factor fixed-effects information matrix.");
-    return llt_XtVinvX.solve(XtVinvy);
+    return response.compute_beta_hat(prepared, G_inv, theta);
 }

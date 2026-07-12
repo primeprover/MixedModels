@@ -25,6 +25,15 @@ inline int total_observation_count(const std::vector<ResponseGroupData>& groups)
     return count;
 }
 
+bool accumulate_groups_response(
+    const PreparedModel& model,
+    const ResponseModel& response,
+    const MatrixXd& G_inv,
+    MatrixXd& XtVinvX,
+    VectorXd& XtVinvy,
+    double& logdetV,
+    double& quad);
+
 class ResponseModel
 {
 public:
@@ -35,7 +44,7 @@ public:
     virtual void initialise_from_prepared(const Rcpp::List& prepared) = 0;
     virtual int parameter_count() const = 0;
     virtual void initialise_working() = 0;
-    virtual void update_working(const VectorXd& parameters) = 0;
+    virtual void update_working(const VectorXd& parameters) const = 0;
     virtual bool parameters_are_valid(const VectorXd& parameters) const = 0;
     virtual double residual_variance_penalty() const = 0;
     virtual void compute_group(
@@ -43,4 +52,8 @@ public:
         const ResponseGroupData& response_group,
         int group_index,
         GroupWorkspace& ws) const = 0;
+    virtual VectorXd compute_beta_hat(
+        const PreparedModel& prepared,
+        const MatrixXd& G_inv,
+        const VectorXd& theta) const = 0;
 };
