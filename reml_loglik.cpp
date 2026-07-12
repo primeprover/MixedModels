@@ -55,6 +55,7 @@ Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
     Rcpp::stop("residual_variance_penalty_weight must be non-negative.");
   model->groups = extract_groups(prepared);
   model->responses.push_back(make_response(prepared));
+  model->responses.back()->initialise_from_prepared(prepared);
   model->responses.back()->initialise_working();
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
