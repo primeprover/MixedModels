@@ -14,7 +14,14 @@ tryCatch(
 )
 
 
-prepare_mixed_data <- function(formula, random, var_pred = NULL, data) {
+prepare_mixed_data <- function(formula, random, var_pred = NULL, data,
+                               residual_variance_penalty_weight = 0) {
+  if (!is.numeric(residual_variance_penalty_weight) ||
+      length(residual_variance_penalty_weight) != 1 ||
+      !is.finite(residual_variance_penalty_weight) ||
+      residual_variance_penalty_weight < 0) {
+    stop("residual_variance_penalty_weight must be one non-negative finite number")
+  }
   if (!inherits(random, "formula")) {
     stop("random must be a formula, e.g. ~ bmi + age | patient")
   }
@@ -105,7 +112,8 @@ prepare_mixed_data <- function(formula, random, var_pred = NULL, data) {
     sigma_y = sigma_y,
     lo_sigma = lo_sigma,
     hi_sigma = hi_sigma,
-    heteroscedastic = heteroscedastic
+    heteroscedastic = heteroscedastic,
+    residual_variance_penalty_weight = residual_variance_penalty_weight
   )
 }
 
@@ -281,12 +289,16 @@ reml_loglik_cpp <- function(theta, model, return_penalty = FALSE) {
 
 fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
                              maxit = 100, verbose = TRUE,
-                             engine = "C++") {
+                             engine = "C++",
+                             residual_variance_penalty_weight = 0) {
   engine <- match.arg(engine)
   
   fake_time <- system.time({}, gcFirst = FALSE)  # Dummy timing to avoid first-time overhead
   print(fake_time)
-  prepare_time <- system.time(prepared <- prepare_mixed_data(formula, random, var_pred, data), gcFirst = FALSE)
+  prepare_time <- system.time(
+    prepared <- prepare_mixed_data(
+      formula, random, var_pred, data, residual_variance_penalty_weight
+    ), gcFirst = FALSE)
   print("Data prepared")
   print(names(prepared))
   # Route to appropriate engine
@@ -310,7 +322,9 @@ fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
     theta_init <- init_theta_general(prepared)
     print("Initial theta values:")
     print(theta_init)
-    theta_len <- prepared$q + prepared$n_corr + 1
+    # The response owns the final parameter block.  For the currently exposed
+    # normal responses this is one log-variance parameter or all W coefficients.
+    theta_len <- length(theta_init)
     y_sd <- prepared$sigma_y
 
     lower <- rep(-Inf, theta_len)
@@ -324,8 +338,9 @@ fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
       upper[corr_idx] <- 4.5
     }
 
-    lower[theta_len] <- log(pmax(y_sd * 1e-6, 1e-12)) - 8
-    upper[theta_len] <- log(pmax(y_sd, 1e-6)) + 8
+    response_idx <- seq.int(prepared$q + prepared$n_corr + 1, theta_len)
+    lower[response_idx] <- log(pmax(y_sd * 1e-6, 1e-12)) - 8
+    upper[response_idx] <- log(pmax(y_sd, 1e-6)) + 8
   }, gcFirst = FALSE)
 
   optim_time <- system.time( {

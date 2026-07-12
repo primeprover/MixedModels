@@ -4,7 +4,7 @@
 
 
 #include "reml_loglik.hpp"
-#include "Response.hpp"
+#include "response.hpp"
 #include <cmath>
 #include <vector>
 #include <atomic>
@@ -26,53 +26,37 @@ std::vector<GroupData> extract_groups(const Rcpp::List& prepared) {
 
   for (int i = 0; i < n_groups; ++i) {
     Rcpp::List group_i = group_list[i];
-    groups[i].X = Rcpp::as<MatrixXd>(group_i["X"]);
     groups[i].Z = Rcpp::as<MatrixXd>(group_i["Z"]);
-    groups[i].y = Rcpp::as<VectorXd>(group_i["y"]);
     groups[i].n = Rcpp::as<int>(group_i["n"]);
     groups[i].ZtZ = Rcpp::as<MatrixXd>(group_i["ZtZ"]);
-    groups[i].ZtY = Rcpp::as<VectorXd>(group_i["ZtY"]);
-    groups[i].ZtX = Rcpp::as<MatrixXd>(group_i["ZtX"]);
-    if (prepared["heteroscedastic"]) {
-      groups[i].W = Rcpp::as<MatrixXd>(group_i["W"]);
-    }
   }
 
   return groups;
 }
 
-WorkingModel initialise_working_model(
-    const PreparedModel& model
-)
-{
-    WorkingModel working;
-
-    working.groups.resize(model.groups.size());
-    for (int g = 0; g < (int)model.groups.size(); ++g) {
-        const int n = model.groups[g].n;
-
-        working.groups[g].eta.resize(n);
-        working.groups[g].inv_resid_var.resize(n);
-    }
-    return working;
-}
+PreparedModel::~PreparedModel() = default;
 
 // [[Rcpp::export]]
 Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   auto model = new PreparedModel();
 
-  model->p        = prepared["p"];
   model->q        = prepared["q"];
   model->n_corr   = prepared["n_corr"];
   model->lo_sigma = prepared["lo_sigma"];
   model->hi_sigma = prepared["hi_sigma"];
-  model->heteroscedastic = prepared["heteroscedastic"];
-
-  model->y = Rcpp::as<VectorXd>(prepared["y"]);
+  model->residual_variance_penalty_weight =
+      prepared.containsElementNamed("residual_variance_penalty_weight")
+          ? Rcpp::as<double>(prepared["residual_variance_penalty_weight"])
+          : 0.0;
+  if (model->residual_variance_penalty_weight < 0.0)
+    Rcpp::stop("residual_variance_penalty_weight must be non-negative.");
   model->groups = extract_groups(prepared);
-  std::cout << "Data prepared apart from working" << std::endl;
-  //_sleep(1000); // Sleep for 1 second to allow time for the message to be viewed
-  model->working = initialise_working_model(*model);
+  const bool heteroscedastic = prepared["heteroscedastic"];
+  if (heteroscedastic)
+    model->responses.push_back(std::make_unique<HeteroNormalResponse>(prepared));
+  else
+    model->responses.push_back(std::make_unique<HomoNormalResponse>(prepared));
+  model->responses.back()->initialise_working();
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
@@ -117,36 +101,19 @@ MatrixXd build_cholesky_cpp(const VectorXd& theta, int q) {
 double compute_penalty(
   const PreparedModel& model,  
   const VectorXd& log_sds,
-  const VectorXd& gamma,
-  const double log_sigma_resid
+  const ResponseModel& response
     ) {
 
-  // Compute penalty on log-SDs
   double penalty = 0.0;
-  if (model.heteroscedastic) {
-    for (const auto& g : model.working.groups)
-      penalty -= g.eta.squaredNorm();
-    penalty *= 10.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
-  }
-  else {
-    for (const auto& g : model.groups)
-    //  penalty -= g.n * std::exp(2.0 * log_sigma_resid);
-      penalty -= g.n * 4.0 * log_sigma_resid * log_sigma_resid;
-    //std::cout << "Penalty from log_sigma_resid: " << penalty << std::endl;
-    penalty *= 10.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
-  }
-  //std::cout << "Penalty from residuals: " << penalty << std::endl;
-  // TODO: fix above penalty to be the same in both cases (heteroscedastic and homoscedastic)
-  // Maybe it should be on the parameters
-  penalty = 0.0;
   for (int i = 0; i < model.q; ++i) {
     double excess_hi = std::max(0.0, log_sds(i) - model.hi_sigma);
     double excess_lo = std::max(0.0, model.lo_sigma - log_sds(i));
     penalty += excess_hi * excess_hi + excess_lo * excess_lo;
     penalty += log_sds(i) * 1000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   }
-  //penalty += gamma.squaredNorm() * 100000000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
   penalty *= 1e-6;
+  penalty += model.residual_variance_penalty_weight *
+      response.residual_variance_penalty();
   //std::cout << "Penalty: " << penalty << " Lo_sigma: " << lo_sigma << " Hi_sigma: " << hi_sigma << std::endl;
   return penalty;
 }
@@ -172,7 +139,7 @@ bool accumulate_groups(
 #endif
 
   const auto& groups = model.groups;
-  const VectorXd& y = model.y;
+  const auto& response = *model.responses.front();
 
   // std::vector<MatrixXd> XtVinvX_loc(n_threads, MatrixXd::Zero(model.p, model.p));
   // std::vector<VectorXd> XtVinvy_loc(n_threads, VectorXd::Zero(model.p));
@@ -216,6 +183,7 @@ bool accumulate_groups(
           if (bad.load(std::memory_order_relaxed)) continue;
 
           const auto& group = groups[ig];
+          const auto& response_group = response.groups[ig];
 
           K.noalias() = G_inv;
           K.noalias() += group.ZtZ * inv_sigma2;
@@ -230,19 +198,19 @@ bool accumulate_groups(
           const double logdetK   = 2.0 * L.diagonal().array().log().sum();
           const double t_logdetV = group.n * std::log(sigma2) + logdetK;
 
-          K_inv_Ziy = llt.solve(group.ZtY);
-          K_inv_Zix = llt.solve(group.ZtX);
+          K_inv_Ziy = llt.solve(response_group.ZtY);
+          K_inv_Zix = llt.solve(response_group.ZtX);
 
-          Vi_inv_y = group.y * inv_sigma2;
+          Vi_inv_y = response_group.y * inv_sigma2;
           Vi_inv_y.noalias() -= group.Z * K_inv_Ziy * inv_sigma2_sq;
 
-          Vi_inv_X = group.X * inv_sigma2;
+          Vi_inv_X = response_group.X * inv_sigma2;
           Vi_inv_X.noalias() -= group.Z * K_inv_Zix * inv_sigma2_sq;
 
-          XtVinvX_local.noalias() += group.X.transpose() * Vi_inv_X;
-          XtVinvy_local.noalias() += group.X.transpose() * Vi_inv_y;
+          XtVinvX_local.noalias() += response_group.X.transpose() * Vi_inv_X;
+          XtVinvy_local.noalias() += response_group.X.transpose() * Vi_inv_y;
           logdetV_local += t_logdetV;
-          quad_local    += group.y.dot(Vi_inv_y);
+          quad_local    += response_group.y.dot(Vi_inv_y);
       }
 
   #ifdef _OPENMP
@@ -311,7 +279,7 @@ inline bool random_effects_compute(
     return true;
 }
 
-bool accumulate_groups_hetero(
+bool accumulate_groups_response(
     const PreparedModel& model,
     const ResponseModel& response,
     const MatrixXd& G_inv,
@@ -324,7 +292,7 @@ bool accumulate_groups_hetero(
     Eigen::setNbThreads(1);
 
     const auto& groups = model.groups;
-    const int p = model.p;
+    const int p = response.groups.front().X.cols();
 
     std::atomic<bool> bad(false);
 
@@ -346,8 +314,10 @@ bool accumulate_groups_hetero(
         for (int ig = 0; ig < (int)groups.size(); ++ig) {
 
             const auto& group = groups[ig];
+            const auto& response_group = response.groups[ig];
 
-            response.compute_group(group, model.working.groups[ig], workspace);
+            response.compute_group(
+                group, response_group, response.working.groups[ig], workspace);
 
             if (!random_effects_compute(group, G_inv, workspace))
             {
@@ -360,10 +330,10 @@ bool accumulate_groups_hetero(
             // ----------------------------------------------------
 
 
-            XtVinvX_local.noalias() += group.X.transpose() * workspace.VinvX;
-            XtVinvy_local.noalias() += group.X.transpose() * workspace.Vinvy;
+            XtVinvX_local.noalias() += response_group.X.transpose() * workspace.VinvX;
+            XtVinvy_local.noalias() += response_group.X.transpose() * workspace.Vinvy;
 
-            quad_local += group.y.dot(workspace.Vinvy);
+            quad_local += response_group.y.dot(workspace.Vinvy);
 
             // group contribution:
             // log|R| + log|G^{-1}+Z'R^{-1}Z|
@@ -400,27 +370,22 @@ Rcpp::List reml_loglik_cpp_impl(
   auto t_start = std::chrono::high_resolution_clock::now();
   //const VectorXd& theta = theta_r;
   const auto& groups = model.groups;
-  const VectorXd& y = model.y;
-  int p = model.p;
+  if (model.responses.size() != 1) {
+    Rcpp::stop("The current REML accumulator supports one response.");
+  }
+  ResponseModel& response = *model.responses.front();
+  const int p = response.groups.front().X.cols();
   int q = model.q;
   int n_corr = model.n_corr;
+  const int response_offset = q + n_corr;
+  if (theta.size() != response_offset + response.parameter_count()) {
+    Rcpp::stop("theta has the wrong number of response parameters.");
+  }
   VectorXd log_sds = theta.head(q);
   VectorXd corrs_unconstrained = theta.segment(q, n_corr);
-  double log_sigma_resid = 0.0;
-  int k = 0;
-  VectorXd gamma;
-  std::unique_ptr<ResponseModel> response;
-
-  if (!model.heteroscedastic) {
-    log_sigma_resid = 0.5*theta(q + n_corr);
-  } else {
-    response = std::make_unique<HeteroNormalResponse>();
-  
-    k = model.groups[0].W.cols();
-    gamma = theta.segment(q + n_corr, k);
-    //std::cout << "Updating working model with " << k << " columns" << std::endl;
-    response->update_working(model, gamma);
-  }
+  VectorXd response_parameters = theta.segment(
+      response_offset, response.parameter_count());
+  response.update_working(response_parameters);
   //double lo_sigma = model.lo_sigma;
   //double hi_sigma = model.hi_sigma;
 
@@ -431,7 +396,8 @@ Rcpp::List reml_loglik_cpp_impl(
   // Parameter validation
   VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
   if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
-  if (!model.heteroscedastic && log_sigma_resid < std::log(std::numeric_limits<double>::epsilon())) return bad_result();
+  if (!response.parameters_are_valid(response_parameters))
+    return bad_result();
   
   // Build Cholesky factor L and compute G = L L'
   MatrixXd L = build_cholesky_cpp(theta, q);
@@ -449,7 +415,7 @@ Rcpp::List reml_loglik_cpp_impl(
   double logdetG = 2.0 * llt_G.matrixLLT().diagonal().array().log().sum();
   
   // Calculate random effects penalties for flat regions and extreme values
-  double penalty = compute_penalty(model, log_sds, gamma, log_sigma_resid);
+  double penalty = compute_penalty(model, log_sds, response);
 
   auto t_after_build = std::chrono::high_resolution_clock::now();
   double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
@@ -461,17 +427,9 @@ Rcpp::List reml_loglik_cpp_impl(
   double quad = 0.0;
 
   auto t_loop_start = std::chrono::high_resolution_clock::now();
-  if (!model.heteroscedastic) {
-    double sigma = std::exp(log_sigma_resid);
-    double sigma2 = sigma * sigma;
-  
-    bool success = accumulate_groups(model, G_inv, sigma2, XtVinvX, XtVinvy, logdetV, quad);
-    if (!success) return bad_result();
-  }
-  else {
-    bool success = accumulate_groups_hetero(model, *response, G_inv, XtVinvX, XtVinvy, logdetV, quad);
-    if (!success) return bad_result();
-  }
+  bool success = accumulate_groups_response(
+      model, response, G_inv, XtVinvX, XtVinvy, logdetV, quad);
+  if (!success) return bad_result();
   auto t_after_groups = std::chrono::high_resolution_clock::now();
   double t_groups = std::chrono::duration<double>(t_after_groups - t_loop_start).count();
   
@@ -493,7 +451,8 @@ Rcpp::List reml_loglik_cpp_impl(
   quad_res = std::max(0.0, quad_res);
   
   // Compute REML log-likelihood
-  int n = y.size();
+  int n = 0;
+  for (const auto& group : response.groups) n += group.y.size();
   double ll = -0.5 * (logdetV + logdet_XtVinvX + quad_res + (n - p) * std::log(2.0 * M_PI));
   
   auto t_after_finalize = std::chrono::high_resolution_clock::now();
@@ -521,72 +480,36 @@ VectorXd compute_beta_hat_cpp(
     const Eigen::VectorXd& theta,
     Rcpp::XPtr<PreparedModel> model
 ) {
-    using Eigen::MatrixXd;
-    using Eigen::VectorXd;
+    PreparedModel& prepared = *model;
+    if (prepared.responses.size() != 1)
+      Rcpp::stop("The current beta calculation supports one response.");
 
-    const int p = model->p;
-    const int q = model->q;
-    const int n_groups = model->groups.size();
+    ResponseModel& response = *prepared.responses.front();
+    const int response_offset = prepared.q + prepared.n_corr;
+    if (theta.size() != response_offset + response.parameter_count())
+      Rcpp::stop("theta has the wrong number of response parameters.");
+    response.update_working(theta.segment(
+        response_offset, response.parameter_count()));
 
-    // --- build G ---
-    MatrixXd L = build_cholesky_cpp(theta, q);
+    MatrixXd L = build_cholesky_cpp(theta, prepared.q);
     MatrixXd G = L * L.transpose();
+    G.diagonal().array() += 1e-8;
+    Eigen::LLT<MatrixXd> llt_G(G);
+    if (llt_G.info() != Eigen::Success)
+      Rcpp::stop("Could not factor random-effects covariance matrix.");
+    MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(prepared.q, prepared.q));
 
-    double sigma = std::exp(theta(theta.size() - 1));
-    double sigma2 = sigma * sigma;
-
-    // jitter + inverse
-    MatrixXd G_jittered = G + 1e-8 * MatrixXd::Identity(q, q);
-    MatrixXd G_inv = G_jittered.inverse();
-
+    const int p = response.groups.front().X.cols();
     MatrixXd XtVinvX = MatrixXd::Zero(p, p);
     VectorXd XtVinvy = VectorXd::Zero(p);
+    double logdetV = 0.0;
+    double quad = 0.0;
+    if (!accumulate_groups_response(
+            prepared, response, G_inv, XtVinvX, XtVinvy, logdetV, quad))
+      Rcpp::stop("Could not accumulate response groups.");
 
-    // precompute constants
-    double inv_sigma2 = 1.0 / sigma2;
-    double inv_sigma4 = inv_sigma2 * inv_sigma2;
-
-    for (int g = 0; g < n_groups; ++g) {
-
-        const auto& group = model->groups[g];
-
-        const MatrixXd& Xi = group.X;
-        const MatrixXd& Zi = group.Z;
-        const VectorXd& yi = group.y;
-
-        const MatrixXd& ZiZi = group.ZtZ;
-        const MatrixXd& Zix  = group.ZtX;
-        const VectorXd& Ziy  = group.ZtY;
-
-        // K = G^{-1} + Z'Z / sigma2
-        MatrixXd K = G_inv + ZiZi * inv_sigma2;
-
-        Eigen::LLT<MatrixXd> llt(K);
-
-        // ---- solve for BOTH RHS at once ----
-        MatrixXd RHS(q, p + 1);
-        RHS << Ziy, Zix;   // careful: adjust if dimensions differ
-
-        MatrixXd K_inv_RHS =
-            llt.solve(RHS);
-
-        VectorXd K_inv_Ziy = K_inv_RHS.col(0);
-        MatrixXd K_inv_Zix = K_inv_RHS.rightCols(p);
-
-        // V^{-1} y
-        VectorXd V_inv_y =
-            (yi * inv_sigma2) - (Zi * K_inv_Ziy) * inv_sigma4;
-
-        // V^{-1} X
-        MatrixXd V_inv_X =
-            (Xi * inv_sigma2) - (Zi * K_inv_Zix) * inv_sigma4;
-
-        XtVinvX.noalias() += Xi.transpose() * V_inv_X;
-        XtVinvy.noalias() += Xi.transpose() * V_inv_y;
-    }
-
-    // beta_hat
-    VectorXd beta_hat = XtVinvX.ldlt().solve(XtVinvy);
-
-    return beta_hat;
+    Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
+    if (llt_XtVinvX.info() != Eigen::Success)
+      Rcpp::stop("Could not factor fixed-effects information matrix.");
+    return llt_XtVinvX.solve(XtVinvy);
 }

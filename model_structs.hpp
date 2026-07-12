@@ -2,52 +2,39 @@
 
 #include <Rcpp.h>
 #include <RcppEigen.h>
+#include <memory>
+#include <vector>
 using namespace Eigen;
 
+class ResponseModel;
 
-struct WorkingGroup {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  VectorXd eta;          // linear predictor for log(residual variance)
-  VectorXd inv_resid_var; // 1 / residual variances
-};
-
-struct WorkingModel {
-  std::vector<WorkingGroup> groups; // one per group
-};
-
-// Group data structure: precomputed matrices for a single group
+// Data shared by all responses in a model.  Response-specific X/y/W data live
+// on the ResponseModel instead.
 struct GroupData {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  MatrixXd X;      // design matrix for fixed effects
   MatrixXd Z;      // design matrix for random effects
-  VectorXd y;      // response vector
   int n;           // number of observations
   MatrixXd ZtZ;    // Z'Z (precomputed)
-  VectorXd ZtY;    // Z'y (precomputed)
-  MatrixXd ZtX;    // Z'X (precomputed)
-  MatrixXd W;      // design matrix for residual variance (if heteroscedastic)
 };
 
 struct PreparedModel {
 
   // static scalar parameters
-  int p;
   int q;
   int n_corr;
-  bool heteroscedastic;
 
   double lo_sigma;
   double hi_sigma;
+  double residual_variance_penalty_weight;
 
-  // static data
-  VectorXd y;
-  MatrixXd W; // design matrix for residual variance (if heteroscedastic)
-
-  // grouped structure
+  // Shared random-effects structure.
   std::vector<GroupData> groups;
 
-  // working model - Mutable state that is updated during optimization
-  WorkingModel working;
+  // Each response owns its data and mutable working state.  The current R
+  // interface creates one response, but this supports independent outcomes.
+  std::vector<std::unique_ptr<ResponseModel>> responses;
+
+  ~PreparedModel();
 };
 
 struct GroupWorkspace {
