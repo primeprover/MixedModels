@@ -17,7 +17,14 @@ struct GroupData {
   MatrixXd ZtZ;    // Z'Z (precomputed)
 };
 
+struct ResponseRandomEffectsMap {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  std::vector<int> global_indices;
+};
+
 struct PreparedModel {
+  std::vector<int> global_random_effect_sizes;
+  std::vector<int> global_random_effect_offsets;
 
   // static scalar parameters
   int q;
@@ -38,6 +45,8 @@ struct PreparedModel {
 };
 
 struct ResponseGroupWorkspace {
+  std::vector<int> random_effect_indices;
+  bool observed = true;
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   MatrixXd RinvZ;

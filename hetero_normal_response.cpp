@@ -16,6 +16,13 @@ std::vector<ResponseGroupData> extract_hetero_groups(const Rcpp::List& prepared)
         groups[i].ZtY = Rcpp::as<VectorXd>(group_i["ZtY"]);
         groups[i].ZtX = Rcpp::as<MatrixXd>(group_i["ZtX"]);
         groups[i].W = Rcpp::as<MatrixXd>(group_i["W"]);
+        if (group_i.containsElementNamed("observed")) {
+            groups[i].observed = Rcpp::as<bool>(group_i["observed"]);
+        }
+        if (group_i.containsElementNamed("random_effect_indices")) {
+            const Rcpp::IntegerVector indices = group_i["random_effect_indices"];
+            groups[i].random_effect_indices.assign(indices.begin(), indices.end());
+        }
     }
     return groups;
 }
@@ -60,10 +67,10 @@ void HeteroNormalResponse::update_working(const VectorXd& parameters) const
 void HeteroNormalResponse::update_working_from_theta(
     const VectorXd& theta,
     int q,
-    int n_corr) const
+    int n_corr,
+    int parameter_offset) const
 {
-    const int response_offset = q + n_corr;
-    update_working(theta.segment(response_offset, parameter_count()));
+    update_working(theta.segment(q + n_corr + parameter_offset, parameter_count()));
 }
 
 bool HeteroNormalResponse::parameters_are_valid(const VectorXd& parameters) const
@@ -74,10 +81,10 @@ bool HeteroNormalResponse::parameters_are_valid(const VectorXd& parameters) cons
 bool HeteroNormalResponse::parameters_are_valid_for_theta(
     const VectorXd& theta,
     int q,
-    int n_corr) const
+    int n_corr,
+    int parameter_offset) const
 {
-    const int response_offset = q + n_corr;
-    return parameters_are_valid(theta.segment(response_offset, parameter_count()));
+    return parameters_are_valid(theta.segment(q + n_corr + parameter_offset, parameter_count()));
 }
 
 double HeteroNormalResponse::residual_variance_penalty() const
@@ -108,7 +115,7 @@ VectorXd HeteroNormalResponse::compute_beta_hat(
     const MatrixXd& G_inv,
     const VectorXd& theta) const
 {
-    update_working_from_theta(theta, prepared.q, prepared.n_corr);
+    update_working_from_theta(theta, prepared.q, prepared.n_corr, 0);
 
     MatrixXd XtVinvX = MatrixXd::Zero(groups.front().X.cols(), groups.front().X.cols());
     VectorXd XtVinvy = VectorXd::Zero(groups.front().X.cols());
@@ -132,15 +139,25 @@ void compute_hetero_normal_group(
     const VectorXd& eta,
     ResponseGroupWorkspace& ws)
 {
-    ws.RinvZ = random_effects_group.Z;
-    ws.RinvX = response_group.X;
-    ws.Rinvy = response_group.y;
-
-    const int n = random_effects_group.Z.rows();
-    for (int i = 0; i < n; ++i) {
-        ws.RinvZ.row(i) *= inv_resid_var(i);
-        ws.RinvX.row(i) *= inv_resid_var(i);
+    int n = random_effects_group.Z.rows();
+    int q_r = response_group.random_effect_indices.size();
+    
+    ws.RinvZ.resize(n, q_r);
+    for (int k = 0; k < q_r; ++k) {
+        int col_idx = response_group.random_effect_indices[k] - 1;
+        if (col_idx >= 0 && col_idx < random_effects_group.Z.cols()) {
+            ws.RinvZ.col(k) = random_effects_group.Z.col(col_idx);
+        }
     }
+    
+    const int N_obs = static_cast<int>(response_group.y.size());
+    ws.RinvX = response_group.X; 
+    for (int i = 0; i < N_obs; ++i) {
+        ws.RinvZ.row(i) *= inv_resid_var(i);
+        ws.RinvX.row(i) *= inv_resid_var(i); 
+    }
+
+    ws.Rinvy = response_group.y;
     ws.Rinvy.array() *= inv_resid_var.array();
-    ws.logdetR = eta.sum();
+    ws.logdetR = eta.sum(); // log|diag(Var)| = sum(log(var)) = sum(eta) since inv_var = exp(-eta)
 }

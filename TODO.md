@@ -77,43 +77,51 @@ work within the most suitable section.
     integration logic that applies to any response once additional response
     types are added, rather than introducing a common normal-response kernel.
 18. [ ] Add tests for merging conditional contributions from two independent
-    responses sharing random effects, before enabling multi-response fitting.
+    responses sharing random effects, before enabling the new `fit_mixed()`
+    interface.
 
 ## Sparse EHR-oriented multi-response models
 
-19. [ ] Define a response-to-global-random-effect map.  Each response uses a
+19. [ ] Introduce a public `fit_mixed()` interface that accepts a list of
+    response specifications.  Each response specification should carry the
+    outcome/fixed-effects formula, the response-specific random-effects design
+    or mapping, and any error/variance options needed for that response.
+    Keep `fit_mixed_simple()` as a thin single-response wrapper for now.
+20. [x] Define a response-to-global-random-effect map.  Each response uses a
     local random-effects design `Z_r` and an ordered vector of indexes into the
     model-wide random-effects vector `b`; shared indexes represent the same
     random effect across responses.
-20. [ ] Implement the normal contribution merge using those maps: scatter each
+21. [x] Implement the normal contribution merge using those maps: scatter each
     response's local `Z_r' R_r^-1 Z_r`, `Z_r' R_r^-1 X_r`, and
     `Z_r' R_r^-1 y_r` contributions into global-random-effect coordinates
     before factorising the shared random-effects system.
-21. [ ] Support response-specific random-slope and interaction columns.  The R
+22. [x] Support response-specific random-slope and interaction columns.  The R
     interface must construct each response's local `Z_r` from its own random
     effects formula/design and map each local column to a global random-effect
     index; no assumption that fixed-effect `X_r` or random-effect `Z_r` terms
     are identical across responses.
-22. [ ] Support groups with no observations for a response.  Such a
+23. [ ] Support groups with no observations for a response.  Such a
     response/group pair contributes nothing to the conditional likelihood;
     its random effects remain informed by observed responses through shared
     effects and correlations in the global random-effects covariance matrix.
-23. [ ] Make response-group data sparse: store only observed response/group
+24. [ ] Make response-group data sparse: store only observed response/group
     pairs and iterate those pairs during contribution construction, while the
     random-effects kernel still iterates the model-wide groups.
-24. [ ] Replace the single-response guards in `reml_loglik_cpp_impl()` and
-    `compute_beta_hat_cpp()` after the merged-contribution contract is tested.
-25. [ ] Replace response-0 assumptions for `p`, observation count, and
+25. [ ] Replace the single-response guards in `reml_loglik_cpp_impl()` and
+    `compute_beta_hat_cpp()` after the merged-contribution contract is tested
+    and the new `fit_mixed()` interface has been exercised on a synthetic
+    two-response example.
+26. [ ] Replace response-0 assumptions for `p`, observation count, and
     fixed-effect accumulation with an explicit multi-response parameter layout.
-26. [ ] Add tests with two responses, partially overlapping groups, a shared
+27. [ ] Add tests with two responses, partially overlapping groups, a shared
     random intercept, response-specific random slopes, and correlated but
     distinct random effects.  Verify that a missing response/group pair adds
     no likelihood contribution and that observed responses still update the
     posterior information for its correlated random effects.
-27. [ ] Keep correlated multivariate residuals out of `ResponseCollection`.
+28. [ ] Keep correlated multivariate residuals out of `ResponseCollection`.
     Independent outcomes may share random effects; a correlated multivariate
     response is a distinct response model.
-28. [ ] Document the missing-data assumption for absent EHR outcomes: absence
+29. [ ] Document the missing-data assumption for absent EHR outcomes: absence
     is conditionally ignorable given the fitted joint model.  If the
     observation process is informative, model it explicitly as an additional
     response rather than treating correlation alone as a missingness model.

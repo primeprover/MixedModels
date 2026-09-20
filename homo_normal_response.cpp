@@ -13,10 +13,17 @@ std::vector<ResponseGroupData> extract_homo_groups(const Rcpp::List& prepared)
     std::vector<ResponseGroupData> groups(group_list.size());
     for (int i = 0; i < group_list.size(); ++i) {
         Rcpp::List group_i = group_list[i];
-        groups[i].X = Rcpp::as<MatrixXd>(group_i["X"]);
+            groups[i].X = Rcpp::as<MatrixXd>(group_i["X"]);
         groups[i].y = Rcpp::as<VectorXd>(group_i["y"]);
         groups[i].ZtY = Rcpp::as<VectorXd>(group_i["ZtY"]);
         groups[i].ZtX = Rcpp::as<MatrixXd>(group_i["ZtX"]);
+        if (group_i.containsElementNamed("observed")) {
+            groups[i].observed = Rcpp::as<bool>(group_i["observed"]);
+        }
+        if (group_i.containsElementNamed("random_effect_indices")) {
+            const Rcpp::IntegerVector indices = group_i["random_effect_indices"];
+            groups[i].random_effect_indices.assign(indices.begin(), indices.end());
+        }
     }
     return groups;
 }
@@ -53,10 +60,10 @@ void HomoNormalResponse::update_working(const VectorXd& parameters) const
 void HomoNormalResponse::update_working_from_theta(
     const VectorXd& theta,
     int q,
-    int n_corr) const
+    int n_corr,
+    int parameter_offset) const
 {
-    const int response_offset = q + n_corr;
-    update_working(theta.segment(response_offset, parameter_count()));
+    update_working(theta.segment(q + n_corr + parameter_offset, parameter_count()));
 }
 
 bool HomoNormalResponse::parameters_are_valid(const VectorXd& parameters) const
@@ -68,10 +75,10 @@ bool HomoNormalResponse::parameters_are_valid(const VectorXd& parameters) const
 bool HomoNormalResponse::parameters_are_valid_for_theta(
     const VectorXd& theta,
     int q,
-    int n_corr) const
+    int n_corr,
+    int parameter_offset) const
 {
-    const int response_offset = q + n_corr;
-    return parameters_are_valid(theta.segment(response_offset, parameter_count()));
+    return parameters_are_valid(theta.segment(q + n_corr + parameter_offset, parameter_count()));
 }
 
 double HomoNormalResponse::residual_variance_penalty() const
@@ -99,7 +106,7 @@ VectorXd HomoNormalResponse::compute_beta_hat(
     const MatrixXd& G_inv,
     const VectorXd& theta) const
 {
-    update_working_from_theta(theta, prepared.q, prepared.n_corr);
+    update_working_from_theta(theta, prepared.q, prepared.n_corr, 0);
 
     MatrixXd XtVinvX = MatrixXd::Zero(groups.front().X.cols(), groups.front().X.cols());
     VectorXd XtVinvy = VectorXd::Zero(groups.front().X.cols());
@@ -123,11 +130,22 @@ void compute_homo_normal_group(
     double log_resid_variance,
     ResponseGroupWorkspace& ws)
 {
-    ws.RinvZ = random_effects_group.Z;
-    ws.RinvX = response_group.X;
-    ws.Rinvy = response_group.y;
+    int n = random_effects_group.Z.rows();
+    int q_r = response_group.random_effect_indices.size();
+    
+    // Extract only the columns belonging to this response
+    ws.RinvZ.resize(n, q_r);
+    for (int k = 0; k < q_r; ++k) {
+        int col_idx = response_group.random_effect_indices[k] - 1; // R is 1-based
+        if (col_idx >= 0 && col_idx < random_effects_group.Z.cols()) {
+            ws.RinvZ.col(k) = random_effects_group.Z.col(col_idx);
+        }
+    }
     ws.RinvZ *= inv_resid_var;
+
+    ws.RinvX = response_group.X;
     ws.RinvX *= inv_resid_var;
+    ws.Rinvy = response_group.y;
     ws.Rinvy.array() *= inv_resid_var;
     ws.logdetR = static_cast<double>(response_group.y.size()) * log_resid_variance;
 }

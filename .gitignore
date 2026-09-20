@@ -2,3 +2,8 @@ Vtune/*
 reml_loglik - Copy.cpp
 *.o
 Direct_likelihood_test.R
+.opencodex/*
+_opc_diag_tmp/*
+.continuerc.json
+repomix-output.xml
+truth_theta_23.rds

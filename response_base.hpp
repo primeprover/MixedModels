@@ -15,6 +15,8 @@ struct ResponseGroupData {
     VectorXd ZtY;
     MatrixXd ZtX;
     MatrixXd W; // Empty for responses without a variance-design matrix.
+    bool observed = true;
+    std::vector<int> random_effect_indices;
 };
 
 struct ConditionalContribution {
@@ -30,10 +32,16 @@ struct ConditionalContribution {
     void add_group_contribution(
         const ResponseGroupData& response_group,
         const ResponseGroupWorkspace& response_workspace,
-        const RandomEffectsIntegrationWorkspace& integration_workspace)
+        const RandomEffectsIntegrationWorkspace& integration_workspace,
+        int fixed_effect_offset,
+        int fixed_effect_dimension)
     {
-        XtVinvX.noalias() += response_group.X.transpose() * integration_workspace.VinvX;
-        XtVinvy.noalias() += response_group.X.transpose() * integration_workspace.Vinvy;
+        // std::cout << "Got here3.9.4 " << std::endl;
+        const MatrixXd info_block = response_group.X.transpose() * integration_workspace.VinvX;
+        const VectorXd vinvy_block = response_group.X.transpose() * integration_workspace.Vinvy;
+        XtVinvX.block(fixed_effect_offset, fixed_effect_offset, fixed_effect_dimension, fixed_effect_dimension).noalias() += info_block;
+        // std::cout << "Got here3.9.5 " << std::endl;
+        XtVinvy.segment(fixed_effect_offset, fixed_effect_dimension).noalias() += vinvy_block;
         quad += response_group.y.dot(integration_workspace.Vinvy);
         logdetV += response_workspace.logdetR + integration_workspace.logdetK;
     }
@@ -70,6 +78,14 @@ public:
     virtual ~ResponseModel() = default;
 
     std::vector<ResponseGroupData> groups;
+    int parameter_offset_ = 0;
+    int fixed_effect_offset_ = 0;
+
+    int parameter_offset() const { return parameter_offset_; }
+    void set_parameter_offset(int value) { parameter_offset_ = value; }
+
+    int fixed_effect_offset() const { return fixed_effect_offset_; }
+    void set_fixed_effect_offset(int value) { fixed_effect_offset_ = value; }
 
     virtual void initialise_from_prepared(const Rcpp::List& prepared) = 0;
     virtual int parameter_count() const = 0;
@@ -79,12 +95,14 @@ public:
     virtual void update_working_from_theta(
         const VectorXd& theta,
         int q,
-        int n_corr) const = 0;
+        int n_corr,
+        int parameter_offset) const = 0;
     virtual bool parameters_are_valid(const VectorXd& parameters) const = 0;
     virtual bool parameters_are_valid_for_theta(
         const VectorXd& theta,
         int q,
-        int n_corr) const = 0;
+        int n_corr,
+        int parameter_offset) const = 0;
     virtual double residual_variance_penalty() const = 0;
     virtual void compute_group(
         const GroupData& random_effects_group,

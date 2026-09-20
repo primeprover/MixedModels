@@ -29,12 +29,14 @@ public:
     void update_working_from_theta(
         const VectorXd& theta,
         int q,
-        int n_corr) const override;
+        int n_corr,
+        int parameter_offset) const override;
     bool parameters_are_valid(const VectorXd& parameters) const override;
     bool parameters_are_valid_for_theta(
         const VectorXd& theta,
         int q,
-        int n_corr) const override;
+        int n_corr,
+        int parameter_offset) const override;
     double residual_variance_penalty() const override;
     void compute_group(const GroupData& random_effects_group,
                        const ResponseGroupData& response_group,
