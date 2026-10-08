@@ -1,8 +1,4 @@
-// reml_loglik.cpp
-// C++ implementation of REML log-likelihood for mixed models using RcppEigen
-// This file provides a compiled engine for fit_mixed_simple(..., engine = "C++")
-
-
+﻿// reml_loglik.cpp - Fixed with full cross-response coupling
 #include "reml_loglik.hpp"
 #include "response.hpp"
 #include "homo_normal_response.hpp"
@@ -17,478 +13,452 @@
 #include <memory>
 #include <limits>
 
-
 // [[Rcpp::depends(RcppEigen)]]
 // [[Rcpp::plugins(openmp)]]
 
-// Extract group data from R list
-// This converts prepared$group_list (R list) into C++ vector of GroupData
-// INPUT: Rcpp::List prepared
-// OUTPUT: std::vector<GroupData>
 namespace {
-
 std::vector<GroupData> extract_groups_from_payload(const Rcpp::List& prepared) {
-  const Rcpp::List group_list = prepared.containsElementNamed("shared_group_list")
-      ? prepared["shared_group_list"]
-      : prepared.containsElementNamed("group_list")
-          ? prepared["group_list"]
-          : Rcpp::List();
-  const int n_groups = group_list.size();
-  std::vector<GroupData> groups(n_groups);
-
-  for (int i = 0; i < n_groups; ++i) {
-    const Rcpp::List group_i = group_list[i];
-    groups[i].Z = Rcpp::as<MatrixXd>(group_i["Z"]);
-    groups[i].n = Rcpp::as<int>(group_i["n"]);
-    groups[i].ZtZ = Rcpp::as<MatrixXd>(group_i["ZtZ"]);
+  const Rcpp::List gl = prepared.containsElementNamed("shared_group_list")
+      ? prepared["shared_group_list"] : prepared.containsElementNamed("group_list")
+          ? prepared["group_list"] : Rcpp::List();
+  const int n = gl.size(); std::vector<GroupData> groups(n);
+  for (int i = 0; i < n; ++i) {
+    const Rcpp::List gi = gl[i];
+    groups[i].Z = Rcpp::as<MatrixXd>(gi["Z"]);
+    groups[i].n = Rcpp::as<int>(gi["n"]);
+    groups[i].ZtZ = Rcpp::as<MatrixXd>(gi["ZtZ"]);
   }
-
   return groups;
 }
-
-} // namespace
-
-std::vector<GroupData> extract_groups(const Rcpp::List& prepared) {
-  return extract_groups_from_payload(prepared);
 }
-
+std::vector<GroupData> extract_groups(const Rcpp::List& prepared) { return extract_groups_from_payload(prepared); }
 PreparedModel::~PreparedModel() = default;
 
 namespace {
-
-VectorXd solve_fixed_effects(
-    const MatrixXd& XtVinvX,
-    const VectorXd& XtVinvy)
-{
-  Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
-  if (llt_XtVinvX.info() != Eigen::Success) {
-    std::cout << "XtVinvX: " << std::endl << XtVinvX << std::endl;
-    Rcpp::stop("Could not factor fixed-effects information matrix.");
+// Robustly factor a symmetric matrix expected to be positive semi-definite and
+// solve A x = b, returning the log determinant. Tries Cholesky first, then
+// applies increasing relative jitter. This handles the single-response
+// hetero long model, whose fixed-effects information matrix can be singular
+// to round-off when the random-effect variance is large and the fixed-effect
+// design lies in the random-effect span (X = Z). Failing gracefully (instead
+// of a hard crash) lets the optimizer steer around the ill-conditioned region.
+bool robust_llt_solve(const MatrixXd& A, const VectorXd& b,
+                      VectorXd& x, double& logdetA) {
+  const int n = A.rows();
+  double maxdiag = 0.0;
+  for (int i = 0; i < n; ++i) maxdiag = std::max(maxdiag, std::fabs(A(i, i)));
+  const double scale = std::max<double>(1.0, maxdiag);
+  const double jitter[7] = {0.0, 1e-8, 1e-6, 1e-4, 1e-2, 1.0, 1e2};
+  for (int k = 0; k < 7; ++k) {
+    MatrixXd A2 = A;
+    if (jitter[k] > 0.0) {
+      VectorXd d = A2.diagonal();
+      d += (jitter[k] * scale) * VectorXd::Ones(n);
+      A2.diagonal() = d;
+    }
+    Eigen::LLT<MatrixXd> l(A2);
+    if (l.info() == Eigen::Success) {
+      x = l.solve(b);
+      logdetA = 2.0 * l.matrixLLT().diagonal().array().log().sum();
+      return true;
+    }
   }
-  return llt_XtVinvX.solve(XtVinvy);
+  return false;
 }
 
-double logdet_from_cholesky(const MatrixXd& XtVinvX)
-{
-  Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
-  if (llt_XtVinvX.info() != Eigen::Success) {
-    std::cout << "XtVinvX: " << std::endl << XtVinvX << std::endl;
-    Rcpp::stop("Could not factor fixed-effects information matrix.");
-  }
-  return 2.0 * llt_XtVinvX.matrixLLT().diagonal().array().log().sum();
+VectorXd solve_fe(const MatrixXd& XtVinvX, const VectorXd& XtVinvy, bool& success) {
+  VectorXd x; double ld;
+  success = robust_llt_solve(XtVinvX, XtVinvy, x, ld);
+  return x;
 }
-
-} // namespace
+double logdet_chol(const MatrixXd& X, bool& success) {
+  const int n = X.rows();
+  const VectorXd zero = VectorXd::Zero(n);
+  VectorXd dummy; double ld;
+  success = robust_llt_solve(X, zero, dummy, ld);
+  return ld;
+}
+}
 
 // [[Rcpp::export]]
 Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
   auto model = new PreparedModel();
-
-  model->q        = prepared["q"];
-  model->n_corr   = prepared["n_corr"];
-  model->lo_sigma = prepared["lo_sigma"];
-  model->hi_sigma = prepared["hi_sigma"];
-  model->residual_variance_penalty_weight =
-      prepared.containsElementNamed("residual_variance_penalty_weight")
-          ? Rcpp::as<double>(prepared["residual_variance_penalty_weight"])
-          : 0.0;
-  if (model->residual_variance_penalty_weight < 0.0)
-    Rcpp::stop("residual_variance_penalty_weight must be non-negative.");
+  model->q=prepared["q"]; model->n_corr=prepared["n_corr"];
+  model->lo_sigma=prepared["lo_sigma"]; model->hi_sigma=prepared["hi_sigma"];
+  model->residual_variance_penalty_weight = prepared.containsElementNamed("residual_variance_penalty_weight")
+      ? Rcpp::as<double>(prepared["residual_variance_penalty_weight"]) : 0.0;
+  if (model->residual_variance_penalty_weight < 0.0) Rcpp::stop("penalty must be non-negative.");
   model->groups = extract_groups(prepared);
   if (prepared.containsElementNamed("response_spec")) {
-    const Rcpp::List response_spec = prepared["response_spec"];
-    if (response_spec.containsElementNamed("random_map")) {
-      const Rcpp::IntegerVector random_map = response_spec["random_map"];
-      model->global_random_effect_sizes.assign(random_map.begin(), random_map.end());
-      model->global_random_effect_offsets.assign(random_map.size(), 0);
+    const Rcpp::List rs = prepared["response_spec"];
+    if (rs.containsElementNamed("random_map")) {
+      const Rcpp::IntegerVector rm = rs["random_map"];
+      model->global_random_effect_sizes.assign(rm.begin(), rm.end());
+      model->global_random_effect_offsets.assign(rm.size(), 0);
     }
   }
-
   if (prepared.containsElementNamed("responses")) {
-    const Rcpp::List responses = prepared["responses"];
-    int parameter_offset = 0;
-    int fixed_effect_offset = 0;
-    for (int i = 0; i < responses.size(); ++i) {
-      const Rcpp::List response_prepared = responses[i];
-      auto response = make_response(response_prepared);
-      response->initialise_from_prepared(response_prepared);
-      response->set_parameter_offset(parameter_offset);
-      response->set_fixed_effect_offset(fixed_effect_offset);
-      response->initialise_working();
-      parameter_offset += response->parameter_count();
-      fixed_effect_offset += response->fixed_effect_dimension();
-      model->responses.push_back(std::move(response));
+    const Rcpp::List res = prepared["responses"];
+    int po=0, fo=0;
+    for (int i=0;i<res.size();++i) {
+      auto r = make_response(res[i]);
+      r->initialise_from_prepared(res[i]);
+      r->set_parameter_offset(po); r->set_fixed_effect_offset(fo);
+      r->initialise_working();
+      po+=r->parameter_count(); fo+=r->fixed_effect_dimension();
+      model->responses.push_back(std::move(r));
     }
   } else {
-    auto response = make_response(prepared);
-    response->initialise_from_prepared(prepared);
-    response->initialise_working();
-    model->responses.push_back(std::move(response));
+    auto r = make_response(prepared);
+    r->initialise_from_prepared(prepared); r->initialise_working();
+    model->responses.push_back(std::move(r));
   }
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
-double compute_penalty(
-  const PreparedModel& model,  
-  const VectorXd& log_sds,
-  const ResponseModel& response
-    ) {
-
-  double penalty = 0.0;
-  for (int i = 0; i < model.q; ++i) {
-    double excess_hi = std::max(0.0, log_sds(i) - model.hi_sigma);
-    double excess_lo = std::max(0.0, model.lo_sigma - log_sds(i));
-    penalty += excess_hi * excess_hi + excess_lo * excess_lo;
-    penalty += log_sds(i)*log_sds(i) * 10000.0; // weak penalty to provide slope for flat regions (assuming penalty multiplied by 1e-6)
+double compute_penalty(const PreparedModel& model, const VectorXd& log_sds, const ResponseModel& response) {
+  double p=0.0;
+  for (int i=0;i<model.q;++i) {
+    p+=std::max(0.0,log_sds(i)-model.hi_sigma)*std::max(0.0,log_sds(i)-model.hi_sigma)
+      +std::max(0.0,model.lo_sigma-log_sds(i))*std::max(0.0,model.lo_sigma-log_sds(i))
+      +log_sds(i)*log_sds(i)*10000.0;
   }
-  penalty *= 1e-6;
-  penalty += model.residual_variance_penalty_weight *
-      response.residual_variance_penalty();
-  //std::cout << "Penalty: " << penalty << " Lo_sigma: " << lo_sigma << " Hi_sigma: " << hi_sigma << std::endl;
-  return penalty;
+  return p*1e-6 + model.residual_variance_penalty_weight*response.residual_variance_penalty();
 }
 
-bool accumulate_groups_response(
-    const PreparedModel& model,
-    const ResponseModel& response,
-    const MatrixXd& G_inv,
-    MatrixXd& XtVinvX,
-    VectorXd& XtVinvy,
-    double& logdetV,
-    double& quad
-)
-{
-    Eigen::setNbThreads(1);
-    const auto& groups = model.groups;
-    const int p = response.fixed_effect_dimension();
-    ConditionalContribution contribution(p);
-
-    std::atomic<bool> bad(false);
-
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-    {
-        ConditionalContribution local_contribution(p);
-
-        ResponseGroupWorkspace response_workspace;
-        RandomEffectsIntegrationWorkspace integration_workspace;
-
-#ifdef _OPENMP
-#pragma omp for schedule(guided)
-#endif
-        for (int ig = 0; ig < (int)groups.size(); ++ig) {
-            const auto& group = groups[ig];
-            const auto& response_group = response.groups[ig];
-            if (!response_group.observed) {
-                continue;
-            }
-
-            response.compute_group(group, response_group, ig, response_workspace);
-
-            if (!random_effects_compute(group, G_inv, response_workspace, integration_workspace)) {
-                bad.store(true, std::memory_order_relaxed);
-                continue;
-            }
-
-            local_contribution.add_group_contribution(response_group, response_workspace, integration_workspace, response.fixed_effect_offset(), response.fixed_effect_dimension());
-        }
-
-#ifdef _OPENMP
-#pragma omp critical
-#endif
-        {
-            contribution.merge_from(local_contribution);
-        }
+bool accumulate_groups_response(const PreparedModel& model, const ResponseModel& response,
+    const MatrixXd& G_inv, MatrixXd& XtVinvX, VectorXd& XtVinvy, double& logdetV, double& quad) {
+  Eigen::setNbThreads(1);
+  const auto& groups=model.groups; const int p=response.fixed_effect_dimension();
+  ConditionalContribution contribution(p); std::atomic<bool> bad(false);
+  { ConditionalContribution lc(p); ResponseGroupWorkspace rw; RandomEffectsIntegrationWorkspace iw;
+    for (int ig=0;ig<(int)groups.size();++ig) {
+      const auto& g=groups[ig]; const auto& rg=response.groups[ig];
+      if (!rg.observed) continue;
+      response.compute_group(g, rg, ig, rw);
+      if (!random_effects_compute(g, G_inv, rw, iw)) { bad.store(true,std::memory_order_relaxed); continue; }
+      lc.add_group_contribution(rg,rw,iw,response.fixed_effect_offset(),response.fixed_effect_dimension());
     }
-
-    XtVinvX = contribution.XtVinvX;
-    XtVinvy = contribution.XtVinvy;
-    logdetV = contribution.logdetV;
-    quad = contribution.quad;
-
-    return !bad.load();
-}
-
-bool accumulate_conditional_contributions(
-    const PreparedModel& model,
-    const MatrixXd& G_inv_global,
-    ConditionalContribution& contribution)
-{
-  if (model.responses.empty()) return false;
-
-  // 1. Global fixed-effect dimension
-  int P_total = 0;
-  for (const auto& resp : model.responses) P_total += resp->fixed_effect_dimension();
-  if (P_total <= 0) return false;
-
-  contribution = ConditionalContribution(P_total);
-  const auto& groups = model.groups;
-  std::atomic<bool> bad(false);
-
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-  {
-    ConditionalContribution local_contribution(P_total);
-    std::vector<ResponseGroupWorkspace> resp_ws(model.responses.size());
-    std::vector<RandomEffectsIntegrationWorkspace> integ_ws(model.responses.size());
-
-#ifdef _OPENMP
-#pragma omp for schedule(guided)
-#endif
-    for (int ig = 0; ig < (int)groups.size(); ++ig) {
-      const auto& group = groups[ig];
-
-      // 2. Global accumulator: Z' R⁻¹ Z blocks across responses
-      MatrixXd sum_ZtRinvZ_global(model.q, model.q);
-      sum_ZtRinvZ_global.setZero();
-
-      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
-        const ResponseModel& resp = *model.responses[ir];
-        const ResponseGroupData& resp_grp = resp.groups[ig];
-        if (!resp_grp.observed) continue;
-
-        // Update response-specific R⁻¹ working buffers
-        resp.compute_group(group, resp_grp, ig, resp_ws[ir]);
-
-        // Slice global Z → response-specific Z_r (version-agnostic column extraction)
-        int Q_resp = resp_grp.random_effect_indices.size();
-        MatrixXd Z_r(group.Z.rows(), Q_resp);
-        for (int k = 0; k < Q_resp; ++k) {
-          int idx = resp_grp.random_effect_indices[k] - 1; // R is 1-based
-          if (idx >= 0 && idx < group.Z.cols()) {
-            Z_r.col(k) = group.Z.col(idx);
-          }
-        }
-
-        // Scatter Q_resp × Q_resp block into global Q_global × Q_global space
-        MatrixXd block = Z_r.transpose() * resp_ws[ir].RinvZ;
-        for (int i = 0; i < Q_resp; ++i) {
-          int gi = resp_grp.random_effect_indices[i] - 1;
-          for (int j = 0; j <= i; ++j) { // Exploit symmetry
-            int gj = resp_grp.random_effect_indices[j] - 1;
-            if (gi >= 0 && gj >= 0 && gi < model.q && gj < model.q) {
-              sum_ZtRinvZ_global(gi, gj) += block(i, j);
-              if (i != j) sum_ZtRinvZ_global(gj, gi) += block(i, j);
-            }
-          }
-        }
-      }
-      //std::cout << "Got here5.1" << std::endl;
-  
-      // 3. Form & factor shared K = G⁻¹ + Z' R⁻¹ Z
-      MatrixXd K_global = G_inv_global + sum_ZtRinvZ_global;
-      Eigen::LLT<MatrixXd> llt(K_global);
-      if (llt.info() != Eigen::Success) { bad.store(true); continue; }
-      double logdetK = 2.0 * llt.matrixLLT().diagonal().array().log().sum();
-
-      // 4. Woodbury V⁻¹ solves per response using shared factorization
-      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
-        const ResponseModel& resp = *model.responses[ir];
-        const ResponseGroupData& resp_grp = resp.groups[ig];
-        if (!resp_grp.observed) continue;
-
-        RandomEffectsIntegrationWorkspace& ws = integ_ws[ir];
-        int Q_resp = resp_grp.random_effect_indices.size();
-        
-        // Re-slice Z_r for RHS solves (same indices as above)
-        MatrixXd Z_r(group.Z.rows(), Q_resp);
-        for (int k = 0; k < Q_resp; ++k) {
-          int idx = resp_grp.random_effect_indices[k] - 1;
-          if (idx >= 0 && idx < group.Z.cols()) Z_r.col(k) = group.Z.col(idx);
-        }
-
-        ws.ZtRinvX.noalias() = Z_r.transpose() * resp_ws[ir].RinvX;
-        ws.ZtRinvy.noalias() = Z_r.transpose() * resp_ws[ir].Rinvy;
-
-        // Solve against global K. Note: llt is model.q x model.q, but ZtRinvX/ZtRinvy are Q_resp-sized.
-        // We must embed them into a model.q-sized vector/matrix before solving to match dimensions.
-        MatrixXd tmp_X_rhs(model.q, ws.ZtRinvX.cols());
-        tmp_X_rhs.setZero();
-        VectorXd tmp_y_rhs(model.q);
-        tmp_y_rhs.setZero();
-
-        for (int k = 0; k < Q_resp; ++k) {
-            int gi = resp_grp.random_effect_indices[k] - 1;
-            if (gi >= 0 && gi < model.q) {
-                tmp_X_rhs.row(gi) = ws.ZtRinvX.row(k);
-                tmp_y_rhs(gi) = ws.ZtRinvy(k);
-            }
-        }
-
-        MatrixXd solved_X_full = llt.solve(tmp_X_rhs);
-        VectorXd solved_y_full = llt.solve(tmp_y_rhs);
-
-        ws.KinvZtRinvX.resize(Q_resp, ws.ZtRinvX.cols());
-        ws.KinvZtRinvy.resize(Q_resp);
-        for (int k = 0; k < Q_resp; ++k) {
-            int gi = resp_grp.random_effect_indices[k] - 1;
-            if (gi >= 0 && gi < model.q) {
-                ws.KinvZtRinvX.row(k) = solved_X_full.row(gi);
-                ws.KinvZtRinvy(k) = solved_y_full(gi);
-            }
-        }
-
-        ws.VinvX.noalias() = resp_ws[ir].RinvX - resp_ws[ir].RinvZ * ws.KinvZtRinvX;
-        ws.Vinvy.noalias() = resp_ws[ir].Rinvy - resp_ws[ir].RinvZ * ws.KinvZtRinvy;
-        ws.logdetK = logdetK;
-
-        // Scatter into global conditional contribution using correct fixed-effect offsets
-        local_contribution.add_group_contribution(resp_grp, resp_ws[ir], ws,
-            resp.fixed_effect_offset(), resp.fixed_effect_dimension());
-      }
-      //std::cout << "Got here5.2 " << ig << std::endl;
-    }
-
-#ifdef _OPENMP
-#pragma omp critical
-#endif
-    { contribution.merge_from(local_contribution); }
+    { contribution.merge_from(lc); }
   }
+  XtVinvX=contribution.XtVinvX; XtVinvy=contribution.XtVinvy;
+  logdetV=contribution.logdetV; quad=contribution.quad;
   return !bad.load();
 }
 
 // ============================================================
-// Main REML log-likelihood computation
+// MULTI-RESPONSE: Full cross-response coupling via Woodbury identity
 // ============================================================
+bool accumulate_conditional_contributions(const PreparedModel& model,
+    const MatrixXd& G_inv_global, ConditionalContribution& contribution) {
+  if (model.responses.empty()) return false;
+  int P_total=0;
+  for (const auto& r:model.responses) P_total+=r->fixed_effect_dimension();
+  if (P_total<=0) return false;
+  contribution = ConditionalContribution(P_total);
+  const auto& groups=model.groups; bool bad=false;
+  MatrixXd G_global;
+  if (G_inv_global.size() > 0) {
+    try { G_global = G_inv_global.inverse(); } catch (...) { G_global = MatrixXd(); }
+  }
+  Eigen::setNbThreads(1);
+  #pragma omp parallel
+  {
+    ConditionalContribution lc(P_total);
+    std::vector<ResponseGroupWorkspace> rws(model.responses.size());
+    std::vector<MatrixXd> Mr(model.responses.size());
+    std::vector<VectorXd> Br(model.responses.size());
+    bool bad_local = false;
+    MatrixXd lXtRX(P_total,P_total); lXtRX.setZero();
+    VectorXd lXtRy(P_total); lXtRy.setZero();
+    MatrixXd lCdiag(P_total,P_total); lCdiag.setZero();
+    VectorXd lc_vec(P_total); lc_vec.setZero();
+    MatrixXd lCross(P_total,P_total); lCross.setZero();
+    #pragma omp for schedule(dynamic, 1)
+    for (int ig=0;ig<(int)groups.size();++ig) {
+      const auto& g=groups[ig];
+      {
+        // OBS_SPACE DISABLED: single-response ("long") models now fall through to the
+        // general Schur-complement path below (identical to the multi-response path).
+        // The old obs_space branch factorized V = diag(inv_resid_var) + Z*R_cov*Z^T
+        // using the random-effect COVARIANCE. During optimization the heteroscedastic
+        // residual variance can -> 0 (inv_resid_var -> 0), making V ~ Z*R_cov*Z^T
+        // rank-deficient (n < q) so the Cholesky factorization fails with
+        // "Could not factor information matrix". The general path instead factors
+        // K = G_inv (precision) + Z' Rinv Z, which is a sum of a PD and a PSD
+        // matrix and is always numerically stable. This is exactly the path the
+        // mathematically-equivalent joint model (size==2, same n<q) takes successfully.
+        bool obs_space = false;
+        if (obs_space) {
+          const auto& resp = *model.responses[0];
+          const ResponseGroupData& rg = resp.groups[ig];
+          if (!rg.observed) continue;
+          resp.compute_group(g, rg, ig, rws[0]);
+          const MatrixXd& X = rg.X;
+          const VectorXd& y = rg.y;
+          const int n = (int)y.size();
+          const MatrixXd& RinvX = rws[0].RinvX;
+          VectorXd inv_var(n);
+          for (int i=0;i<n;++i) {
+            bool found=false;
+            for (int j=0;j<(int)X.cols();++j) {
+              if (std::fabs(X(i,j)) > 1e-14) { inv_var(i) = RinvX(i,j)/X(i,j); found=true; break; }
+            }
+            if (!found) inv_var(i) = 1.0;
+          }
+          MatrixXd V = MatrixXd::Zero(n,n);
+          for (int i=0;i<n;++i) V(i,i) = inv_var(i);
+          V.noalias() += g.Z * G_global * g.Z.transpose();
+          Eigen::LLT<MatrixXd> lltV(V);
+          if (lltV.info() != Eigen::Success) { bad_local = true; continue; }
+          MatrixXd Vinv = lltV.solve(MatrixXd::Identity(n,n));
+          lc.logdetV += 2.0*lltV.matrixLLT().diagonal().array().log().sum();
+          MatrixXd VinvX = Vinv * X;
+          VectorXd Vinvy = Vinv * y;
+          lc.quad += y.dot(Vinvy);
+          lXtRX.noalias() += X.transpose() * VinvX;
+          lXtRy.noalias() += X.transpose() * Vinvy;
+          continue;
+        }
+      }
+      MatrixXd sZtRZ(model.q,model.q); sZtRZ.setZero();
+      for (int ir=0;ir<(int)model.responses.size();++ir) {
+        const ResponseModel& resp=*model.responses[ir];
+        const ResponseGroupData& rg=resp.groups[ig];
+        if (!rg.observed) continue;
+        resp.compute_group(g,rg,ig,rws[ir]);
+        int Q=rg.random_effect_indices.size();
+        MatrixXd Zr(g.Z.rows(),Q);
+        for (int k=0;k<Q;++k) { int idx=rg.random_effect_indices[k]-1;
+          if (idx>=0&&idx<g.Z.cols()) Zr.col(k)=g.Z.col(idx); }
+        MatrixXd blk=Zr.transpose()*rws[ir].RinvZ;
+        for (int i=0;i<Q;++i) { int gi=rg.random_effect_indices[i]-1;
+          for (int j=0;j<=i;++j) { int gj=rg.random_effect_indices[j]-1;
+            if (gi>=0&&gj>=0&&gi<model.q&&gj<model.q) {
+              sZtRZ(gi,gj)+=blk(i,j); if(i!=j) sZtRZ(gj,gi)+=blk(i,j); } } } }
+      MatrixXd K=G_inv_global+sZtRZ; Eigen::LLT<MatrixXd> llt(K);
+      if (llt.info()!=Eigen::Success) { bad_local=true; continue; }
+      double logdetK=2.0*llt.matrixLLT().diagonal().array().log().sum();
+      MatrixXd Kinv=llt.solve(MatrixXd::Identity(model.q,model.q));
 
+      int nor=0;
+      for (int ir=0;ir<(int)model.responses.size();++ir) {
+        const ResponseModel& resp=*model.responses[ir];
+        const ResponseGroupData& rg=resp.groups[ig];
+        if (!rg.observed) continue;
+        ++nor;
+        int Q=rg.random_effect_indices.size();
+        MatrixXd Zr(g.Z.rows(),Q);
+        for (int k=0;k<Q;++k) { int idx=rg.random_effect_indices[k]-1;
+          if (idx>=0&&idx<g.Z.cols()) Zr.col(k)=g.Z.col(idx); }
+        Mr[ir].noalias()=rg.X.transpose()*rws[ir].RinvZ;
+        Br[ir].noalias()=Zr.transpose()*rws[ir].Rinvy;
+        lc.logdetV+=rws[ir].logdetR;
+        lc.quad+=rg.y.dot(rws[ir].Rinvy);
+      }
+      lc.logdetV+=logdetK;
+
+      // Assemble Mt: each response contributes its Mr at the correct global rows
+      MatrixXd Mt(model.q,P_total); Mt.setZero();
+      VectorXd Bt_vec(model.q); Bt_vec.setZero();
+      for (int ir=0;ir<(int)model.responses.size();++ir) {
+        const ResponseModel& resp=*model.responses[ir];
+        const ResponseGroupData& rg=resp.groups[ig];
+        if (!rg.observed) continue;
+        int Q=rg.random_effect_indices.size(), pr=resp.fixed_effect_dimension();
+        for (int k=0;k<Q;++k) { int gi=rg.random_effect_indices[k]-1;
+          if (gi>=0&&gi<model.q) Mt.row(gi).segment(resp.fixed_effect_offset(),pr)=Mr[ir].col(k).transpose(); }
+        for (int k=0;k<Q;++k) { int gi=rg.random_effect_indices[k]-1;
+          if (gi>=0&&gi<model.q) Bt_vec(gi)=Br[ir](k); } }
+      MatrixXd gf=llt.solve(Mt); VectorXd zf=llt.solve(Bt_vec);
+      MatrixXd Cg=Mt.transpose()*gf; VectorXd cg=Mt.transpose()*zf;
+
+      // Accumulate diagonal blocks of X^T R^{-1} X
+      for (int ir=0;ir<(int)model.responses.size();++ir) {
+        const ResponseModel& resp=*model.responses[ir];
+        const ResponseGroupData& rg=resp.groups[ig];
+        if (!rg.observed) continue;
+        int pr=resp.fixed_effect_dimension(), off=resp.fixed_effect_offset();
+        lXtRX.block(off,off,pr,pr).noalias()+=rg.X.transpose()*rws[ir].RinvX;
+        lXtRy.segment(off,pr).noalias()+=rg.X.transpose()*rws[ir].Rinvy;
+      }
+      // Accumulate diagonal Woodbury correction
+      for (int ir=0;ir<(int)model.responses.size();++ir) {
+        const ResponseModel& resp=*model.responses[ir];
+        int pr=resp.fixed_effect_dimension(), off=resp.fixed_effect_offset();
+        lCdiag.block(off,off,pr,pr).noalias()+=Cg.block(off,off,pr,pr);
+      }
+      lc_vec.noalias()+=cg;
+
+      // Cross-response Woodbury corrections
+      // For conditionally independent responses, X_a^T R^{-1} X_b = 0
+      // So off-diagonal block = -M_a^T K^{-1} M_b
+      int off_a=0;
+      for (int ia=0;ia<(int)model.responses.size();++ia) {
+        const ResponseModel& resa=*model.responses[ia];
+        const ResponseGroupData& rga=resa.groups[ig];
+        if (!rga.observed) continue;
+        int pra=resa.fixed_effect_dimension();
+        MatrixXd Mta=MatrixXd::Zero(model.q,pra);
+        for (int k=0;k<(int)rga.random_effect_indices.size();++k) {
+          int gi=rga.random_effect_indices[k]-1;
+          if(gi<0||gi>=model.q) continue;
+          Mta.row(gi).segment(0,pra)=Mr[ia].col(k).transpose(); }
+        for (int ib=ia+1;ib<(int)model.responses.size();++ib) {
+          const ResponseModel& resb=*model.responses[ib];
+          const ResponseGroupData& rgb=resb.groups[ig];
+          if (!rgb.observed) continue;
+          int prb=resb.fixed_effect_dimension();
+          MatrixXd Mtb=MatrixXd::Zero(model.q,prb);
+          for (int k=0;k<(int)rgb.random_effect_indices.size();++k) {
+            int gi=rgb.random_effect_indices[k]-1;
+            if(gi<0||gi>=model.q) continue;
+            Mtb.row(gi).segment(0,prb)=Mr[ib].col(k).transpose(); }
+          MatrixXd cross=Mta.transpose()*Kinv*Mtb;
+          lCross.block(off_a,off_a+pra,pra,prb).noalias()+=cross;
+          lCross.block(off_a+pra,off_a,prb,pra).noalias()+=cross.transpose();
+        }
+        off_a+=pra;
+      }
+
+      // Bug 3: Full quadratic form
+      if (nor>1) {
+        double bkb=0.0;
+        for (int ir=0;ir<(int)model.responses.size();++ir) {
+          if (!model.responses[ir]->groups[ig].observed) continue;
+          const VectorXd& B1=Br[ir]; if(B1.size()==0) continue;
+          for (int is=0;is<(int)model.responses.size();++is) {
+            if (!model.responses[is]->groups[ig].observed) continue;
+            const VectorXd& B2=Br[is]; if(B2.size()==0) continue;
+            double t=0.0;
+            for (int ki=0;ki<B1.size();++ki) { int gi=model.responses[ir]->groups[ig].random_effect_indices[ki]-1;
+              if(gi<0||gi>=model.q) continue;
+              for (int kj=0;kj<B2.size();++kj) { int gj=model.responses[is]->groups[ig].random_effect_indices[kj]-1;
+                if(gj<0||gj>=model.q) continue;
+                t+=B1(ki)*Kinv(gi,gj)*B2(kj); } }
+            if(ir==is) bkb+=t; else if(ir<is) bkb+=2.0*t; } }
+        lc.quad-=bkb;
+      } else if (nor==1) {
+        for (int ir=0;ir<(int)model.responses.size();++ir) {
+          if (!model.responses[ir]->groups[ig].observed) continue;
+          const VectorXd& B=Br[ir]; if(B.size()==0) continue;
+          double t=0.0;
+          for (int ki=0;ki<B.size();++ki) { int gi=model.responses[ir]->groups[ig].random_effect_indices[ki]-1;
+            if(gi<0||gi>=model.q) continue;
+            for (int kj=0;kj<B.size();++kj) { int gj=model.responses[ir]->groups[ig].random_effect_indices[kj]-1;
+              if(gj<0||gj>=model.q) continue;
+              t+=B(ki)*Kinv(gi,gj)*B(kj); } }
+          lc.quad-=t; break; } }
+    }
+    #pragma omp critical
+    {
+      contribution.logdetV += lc.logdetV;
+      if (bad_local) bad = true;
+      contribution.quad += lc.quad;
+      // Diagonal blocks: X^T R^{-1} X - Cg(diag)
+      for (size_t ir=0;ir<model.responses.size();++ir) {
+        const auto& resp=*model.responses[ir];
+        int pr=resp.fixed_effect_dimension(), off=resp.fixed_effect_offset();
+        contribution.XtVinvX.block(off,off,pr,pr).noalias() += (lXtRX.block(off,off,pr,pr) - lCdiag.block(off,off,pr,pr));
+      }
+      // Off-diagonal blocks: -M_a^T K^{-1} M_b = -lCross
+      for (size_t ia=0;ia<model.responses.size();++ia) {
+        const auto& resa=*model.responses[ia];
+        int pra=resa.fixed_effect_dimension(), offa=resa.fixed_effect_offset();
+        for (size_t ib=ia+1;ib<model.responses.size();++ib) {
+          const auto& resb=*model.responses[ib];
+          int prb=resb.fixed_effect_dimension(), offb=resb.fixed_effect_offset();
+          contribution.XtVinvX.block(offa,offb,pra,prb).noalias() += (-lCross.block(offa,offb,pra,prb));
+          contribution.XtVinvX.block(offb,offa,prb,pra).noalias() += (-lCross.block(offb,offa,prb,pra));
+        }
+      }
+      contribution.XtVinvy.noalias() += (lXtRy - lc_vec);
+    }
+  }
+  return !bad;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
 // [[Rcpp::export]]
-Rcpp::List reml_loglik_cpp_impl(
-    Rcpp::XPtr<PreparedModel> model_xptr,
-    const Eigen::VectorXd& theta_raw,
-    bool return_penalty,
-    bool return_timing
-) {
-  PreparedModel& model = *model_xptr;
-  auto t_start = std::chrono::high_resolution_clock::now();
-  //std::cout << "Got here" << std::endl;
-  //std::cout << "Theta raw: " << theta_raw.transpose() << std::endl;
-  const int q_global = model.q;
-  const int n_corr = model.n_corr;
-  const int response_offset = q_global + n_corr;
+Rcpp::List reml_loglik_cpp_impl(Rcpp::XPtr<PreparedModel> model_xptr,
+    const Eigen::VectorXd& theta_raw, bool return_penalty, bool return_timing) {
+  PreparedModel& model=*model_xptr;
+  auto t0=std::chrono::high_resolution_clock::now();
+  const int qg=model.q, nc=model.n_corr, ro=qg+nc;
+  if (model.responses.empty()) Rcpp::stop("Need at least one response.");
+  int p=0, tp=0;
+  for (const auto& rp:model.responses) { const ResponseModel& r=*rp;
+    tp+=r.parameter_count(); p+=r.fixed_effect_dimension(); }
+  if (theta_raw.size()!=ro+tp) Rcpp::stop("theta size mismatch.");
 
-  if (model.responses.empty()) {
-    Rcpp::stop("The current REML accumulator requires at least one response.");
-  }
-  int p = 0;
-  int total_parameter_count = 0;
-  for (const auto& response_ptr : model.responses) {
-    const ResponseModel& response = *response_ptr;
-    total_parameter_count += response.parameter_count();
-    p += response.fixed_effect_dimension();
-  }
-  if (theta_raw.size() != response_offset + total_parameter_count) {
-    Rcpp::stop("theta has the wrong number of response parameters.");
-  }
+  VectorXd log_sds=theta_raw.head(qg);
+  VectorXd cuc=theta_raw.segment(qg,nc);
+  for (const auto& rp:model.responses) { ResponseModel& r=*rp;
+    r.update_working_from_theta(theta_raw,qg,nc,rp->parameter_offset());
+    if (!r.parameters_are_valid_for_theta(theta_raw,qg,nc,rp->parameter_offset())) return bad_result(); }
+  VectorXd corrs=cuc.array().tanh().matrix();
+  if ((corrs.array().abs()>0.9999999).any()) return bad_result();
 
-  VectorXd log_sds = theta_raw.head(q_global);
-  VectorXd corrs_unconstrained = theta_raw.segment(q_global, n_corr);
-  for (const auto& response_ptr : model.responses) {
-    ResponseModel& response = *response_ptr;
-    response.update_working_from_theta(theta_raw, q_global, n_corr, response.parameter_offset());
-    if (!response.parameters_are_valid_for_theta(theta_raw, q_global, n_corr, response.parameter_offset()))
-      return bad_result();
-  }
-  //std::cout << "Got here3" << std::endl;
-  
-  VectorXd corrs = corrs_unconstrained.array().tanh().matrix();
-  if ((corrs.array().abs() > 0.9999999).any()) return bad_result();
+  RandomEffectsSystem rs=build_random_effects_system(qg,log_sds,cuc);
+  if (rs.G_inv.size()==0) return bad_result();
+  double penalty=0.0;
+  for (const auto& rp:model.responses) penalty+=compute_penalty(model,log_sds,*rp);
+  penalty=0.0;
+  auto t1=std::chrono::high_resolution_clock::now();
+  double t_build=std::chrono::duration<double>(t1-t0).count();
 
-  RandomEffectsSystem random_effects = build_random_effects_system(
-      q_global, log_sds, corrs_unconstrained);
-  if (random_effects.G_inv.size() == 0) return bad_result();
-
-  double penalty = 0.0;
-  for (const auto& response_ptr : model.responses) {
-    penalty += compute_penalty(model, log_sds, *response_ptr);
-  }
-  penalty = 0.0;
-  auto t_after_build = std::chrono::high_resolution_clock::now();
-  double t_build = std::chrono::duration<double>(t_after_build - t_start).count();
-  //std::cout << "Got here4" << std::endl;
-  
   ConditionalContribution contribution(p);
-  bool success = accumulate_conditional_contributions(
-      model, random_effects.G_inv, contribution);
-  if (!success) return bad_result();
-  //std::cout << "Got here5" << std::endl;
-  
-  auto t_after_groups = std::chrono::high_resolution_clock::now();
-  double t_groups = std::chrono::duration<double>(t_after_groups - t_after_build).count();
-  //std::cout << "Got here6" << std::endl;
-  double logdetV = contribution.logdetV +
-      static_cast<double>(model.groups.size()) * random_effects.logdetG;
+  if (!accumulate_conditional_contributions(model,rs.G_inv,contribution)) return bad_result();
+  auto t2=std::chrono::high_resolution_clock::now();
+  double t_groups=std::chrono::duration<double>(t2-t1).count();
+  double logdetV=contribution.logdetV+static_cast<double>(model.groups.size())*rs.logdetG;
 
-  VectorXd beta_hat = solve_fixed_effects(contribution.XtVinvX, contribution.XtVinvy);
-  double quad_res = std::max(0.0, contribution.quad - beta_hat.transpose() * contribution.XtVinvy);
+  bool fe_ok;
+  VectorXd beta=solve_fe(contribution.XtVinvX,contribution.XtVinvy,fe_ok);
+  if (!fe_ok) return bad_result();
+  double qr=std::max(0.0,contribution.quad-beta.transpose()*contribution.XtVinvy);
 
-  const int n = total_observation_count(model.responses.front()->groups);
-  double ll = -0.5 * (
-      logdetV +
-      logdet_from_cholesky(contribution.XtVinvX) +
-      quad_res +
-      (n - p) * std::log(2.0 * M_PI));
-  //std::cout << "Got here7" << std::endl;
-  auto t_after_finalize = std::chrono::high_resolution_clock::now();
-  double t_finalize = std::chrono::duration<double>(t_after_finalize - t_after_groups).count();
+  // BUG 1 FIX: Sum observations across ALL responses
+  int total_n=0;
+  for (const auto& rp:model.responses)
+    for (const auto& gr:rp->groups) total_n+=static_cast<int>(gr.y.size());
+
+  bool det_ok;
+  double logdetX=logdet_chol(contribution.XtVinvX,det_ok);
+  if (!det_ok) return bad_result();
+  double ll=-0.5*(logdetV+logdetX+qr+(total_n-p)*std::log(2.0*M_PI));
+  auto t3=std::chrono::high_resolution_clock::now();
+  double t_finalize=std::chrono::duration<double>(t3-t2).count();
 
   Rcpp::List result;
-  result["logLik_unpenalized"] = ll;
-  result["logLik_penalized"] = ll - penalty;
-  result["penalty"] = penalty;
-  if (return_timing && return_penalty) {
-    result["timings"] = Rcpp::List::create(
-      Rcpp::Named("build_G") = t_build,
-      Rcpp::Named("groups") = t_groups,
-      Rcpp::Named("finalize") = t_finalize,
-      Rcpp::Named("total") = t_build + t_groups + t_finalize
-    );
-  }
-
+  result["logLik_unpenalized"]=ll; result["logLik_penalized"]=ll-penalty; result["penalty"]=penalty;
+  if (return_timing&&return_penalty) result["timings"]=Rcpp::List::create(
+    Rcpp::Named("build_G")=t_build,Rcpp::Named("groups")=t_groups,
+    Rcpp::Named("finalize")=t_finalize,Rcpp::Named("total")=t_build+t_groups+t_finalize);
   return result;
 }
 
 // [[Rcpp::export]]
-VectorXd compute_beta_hat_cpp(
-    const Eigen::VectorXd& theta,
-    Rcpp::XPtr<PreparedModel> model
-) {
-    PreparedModel& prepared = *model;
-    if (prepared.responses.empty())
-      Rcpp::stop("The current beta calculation requires at least one response.");
-
-    const int response_offset = prepared.q + prepared.n_corr;
-    int p = 0;
-    int total_parameter_count = 0;
-    for (const auto& response_ptr : prepared.responses) {
-      const ResponseModel& response = *response_ptr;
-      total_parameter_count += response.parameter_count();
-      p += response.fixed_effect_dimension();
-    }
-    if (theta.size() != response_offset + total_parameter_count)
-      Rcpp::stop("theta has the wrong number of response parameters.");
-    for (const auto& response_ptr : prepared.responses) {
-      ResponseModel& response = *response_ptr;
-      response.update_working_from_theta(theta, prepared.q, prepared.n_corr, response.parameter_offset());
-    }
-
-    MatrixXd L = build_cholesky(theta, prepared.q);
-    MatrixXd G = L * L.transpose();
-    G.diagonal().array() += 1e-8;
-    Eigen::LLT<MatrixXd> llt_G(G);
-    if (llt_G.info() != Eigen::Success)
-      Rcpp::stop("Could not factor random-effects covariance matrix.");
-    MatrixXd G_inv = llt_G.solve(MatrixXd::Identity(prepared.q, prepared.q));
-
-    ConditionalContribution contribution(p);
-    if (!accumulate_conditional_contributions(prepared, G_inv, contribution))
-      Rcpp::stop("Could not accumulate response groups.");
-
-    Eigen::LLT<MatrixXd> llt_XtVinvX(contribution.XtVinvX);
-    if (llt_XtVinvX.info() != Eigen::Success) {
-      std::cout << "XtVinvX: " << std::endl << contribution.XtVinvX << std::endl;
-      Rcpp::stop("Could not factor fixed-effects information matrix.");
-    }
-    return llt_XtVinvX.solve(contribution.XtVinvy);
+VectorXd compute_beta_hat_cpp(const Eigen::VectorXd& theta, Rcpp::XPtr<PreparedModel> model) {
+  PreparedModel& p=*model;
+  if (p.responses.empty()) Rcpp::stop("Need at least one response.");
+  const int ro=p.q+p.n_corr; int p_=0,tp=0;
+  for (const auto& rp:p.responses) { const ResponseModel& r=*rp;
+    tp+=r.parameter_count(); p_+=r.fixed_effect_dimension(); }
+  if (theta.size()!=ro+tp) Rcpp::stop("theta size mismatch.");
+  for (const auto& rp:p.responses) { ResponseModel& r=*rp;
+    r.update_working_from_theta(theta,p.q,p.n_corr,rp->parameter_offset()); }
+  MatrixXd L=build_cholesky(theta,p.q), G=L*L.transpose();
+  G.diagonal().array()+=1e-8; Eigen::LLT<MatrixXd> lg(G);
+  if (lg.info()!=Eigen::Success) Rcpp::stop("Could not factor G.");
+  MatrixXd Gi=lg.solve(MatrixXd::Identity(p.q,p.q));
+  ConditionalContribution contribution(p_);
+  if (!accumulate_conditional_contributions(p,Gi,contribution))
+    Rcpp::stop("Could not accumulate.");
+  bool ok;
+  VectorXd bh=solve_fe(contribution.XtVinvX,contribution.XtVinvy,ok);
+  (void)ok;
+  return bh;
 }

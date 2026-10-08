@@ -133,6 +133,17 @@ fit_long <- fit_mixed_simple(
     verbose = FALSE
   )
 
+fit_long2 <- fit_mixed_simple(
+  formula = outcome ~ 1 + response_sbp+ response_sbp:bmi+ response_sbp:age + response_hba1c:HDL + response_hba1c:age,
+  random = ~ 1 + response_sbp+ response_sbp:bmi+ response_sbp:age + response_hba1c:HDL + response_hba1c:age | patient,
+  var_pred = ~ 1 + response_sbp,
+  data = dat2_long,
+  engine = "C++",
+  maxit = 500,
+  verbose = FALSE
+)
+
+
 cat("\nLong model logLik:", fit_long$logLik, "\n")
 cat("Joint model logLik:  ", fit_multi$joint_fit$logLik, "\n")
 cat("Difference in logLik:", (fit_multi$joint_fit$logLik - fit_long$logLik), "\n")
@@ -150,10 +161,15 @@ fit_long$reml_fun(fit_multi$joint_fit$opt_par)
 
 ## test with a specific theta_init to verify that the two likelihood functions are equivalent
 theta_init = c(-1,-1,-2,-1,-1,-1, # 6 random effects SDs (log scale)
-  0.2, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.2, # 15 correlations (Fisher z scale)
-  0.5, 0.4) # 2 residual SDs (log scale)
+               0.2, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.2, # 15 correlations (Fisher z scale)
+               0.5, 0.4) # 2 residual SDs (log scale)
+theta_init2 = c(-1,-1,-2,-1,-1,-1, # 6 random effects SDs (log scale)
+               0.2, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.4, # 15 correlations (Fisher z scale)
+               0.5, 0.4) # 2 residual SDs (log scale)
 fit_long$reml_fun(theta_init)
 fit_multi$joint_fit$reml_fun(theta_init)
+fit_long$reml_fun(theta_init2)
+fit_multi$joint_fit$reml_fun(theta_init2)
 
 library(nlme)
 ## I believe this should be the same as the long format fit above, but using lme() from nlme package. I believe parameters are scaled a bit differently though due to varIdent

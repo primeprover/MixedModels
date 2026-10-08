@@ -26,6 +26,7 @@ struct ConditionalContribution {
     double logdetV = 0.0;
     double quad = 0.0;
 
+    ConditionalContribution() = default;
     explicit ConditionalContribution(int p)
         : XtVinvX(MatrixXd::Zero(p, p)), XtVinvy(VectorXd::Zero(p)) {}
 
@@ -36,11 +37,9 @@ struct ConditionalContribution {
         int fixed_effect_offset,
         int fixed_effect_dimension)
     {
-        // std::cout << "Got here3.9.4 " << std::endl;
         const MatrixXd info_block = response_group.X.transpose() * integration_workspace.VinvX;
         const VectorXd vinvy_block = response_group.X.transpose() * integration_workspace.Vinvy;
         XtVinvX.block(fixed_effect_offset, fixed_effect_offset, fixed_effect_dimension, fixed_effect_dimension).noalias() += info_block;
-        // std::cout << "Got here3.9.5 " << std::endl;
         XtVinvy.segment(fixed_effect_offset, fixed_effect_dimension).noalias() += vinvy_block;
         quad += response_group.y.dot(integration_workspace.Vinvy);
         logdetV += response_workspace.logdetR + integration_workspace.logdetK;

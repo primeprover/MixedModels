@@ -96,6 +96,8 @@ fit_cpp <- fit_mixed_simple(
   data    = dat
 )
 
+fit_cpp
+
 compare_random_effects <- function(G_new, VarCorr_lme) {
   sd_new <- sqrt(diag(G_new))
   cor_new <- cov2cor(G_new)

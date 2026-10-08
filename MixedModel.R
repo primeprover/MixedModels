@@ -109,7 +109,8 @@ prepare_mixed_data <- function(formula, random, var_pred = NULL, data,
         ZtZ = crossprod(Zi),
         ZtY = crossprod(Zi, yi),
         ZtX = crossprod(Zi, Xi),
-        W = wi
+        W = wi,
+        random_effect_indices = as.integer(random_map)
       )
     })
   } else {

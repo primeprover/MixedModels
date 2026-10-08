@@ -7,3 +7,4 @@ _opc_diag_tmp/*
 .continuerc.json
 repomix-output.xml
 truth_theta_23.rds
+test_scripts/*
