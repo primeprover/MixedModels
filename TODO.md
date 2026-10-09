@@ -76,13 +76,13 @@ work within the most suitable section.
     as response implementations. Extract only the shared random-effects
     integration logic that applies to any response once additional response
     types are added, rather than introducing a common normal-response kernel.
-18. [ ] Add tests for merging conditional contributions from two independent
+18. [x] Add tests for merging conditional contributions from two independent
     responses sharing random effects, before enabling the new `fit_mixed()`
     interface.
 
 ## Sparse EHR-oriented multi-response models
 
-19. [ ] Introduce a public `fit_mixed()` interface that accepts a list of
+19. [x] Introduce a public `fit_mixed()` interface that accepts a list of
     response specifications.  Each response specification should carry the
     outcome/fixed-effects formula, the response-specific random-effects design
     or mapping, and any error/variance options needed for that response.
@@ -107,11 +107,11 @@ work within the most suitable section.
 24. [ ] Make response-group data sparse: store only observed response/group
     pairs and iterate those pairs during contribution construction, while the
     random-effects kernel still iterates the model-wide groups.
-25. [ ] Replace the single-response guards in `reml_loglik_cpp_impl()` and
+25. [x] Replace the single-response guards in `reml_loglik_cpp_impl()` and
     `compute_beta_hat_cpp()` after the merged-contribution contract is tested
     and the new `fit_mixed()` interface has been exercised on a synthetic
     two-response example.
-26. [ ] Replace response-0 assumptions for `p`, observation count, and
+26. [x] Replace response-0 assumptions for `p`, observation count, and
     fixed-effect accumulation with an explicit multi-response parameter layout.
 27. [ ] Add tests with two responses, partially overlapping groups, a shared
     random intercept, response-specific random slopes, and correlated but
@@ -180,3 +180,9 @@ work within the most suitable section.
 42. [ ] Consider an explicit observation-process response for informative
     outcome measurement or dropout.  State its missing-data assumptions and
     test it separately from outcome-response correlation.
+
+43. [ ] In `fit_mixed()`, build `shared_group_list` as the union of all
+    responses' groups using per-response observation counts rather than from
+    `response_preparations[[1]]$group_list`; `lo_sigma`/`hi_sigma`/`sigma_y`
+    should not come from the first response alone, so groups observed by only
+    some responses are included.

@@ -101,6 +101,7 @@
 
 ## Key Files
 - `MixedModel.R` - Main R interface (Bug 5 fix in `prepare_mixed_data` hetero branch)
+- `description.md` - Architecture & computational-flow reference (theta layout, data structures, per-eval flow, threading model, module boundaries); keep in sync after structural/flow changes
 - `reml_loglik.cpp` - C++ likelihood (Bugs 1-4 fixed; OpenMP race-free: per-thread accumulators + critical merge; obs_space branch disabled)
 - `homo_normal_response.cpp` / `hetero_normal_response.cpp` - response definitions
 - `response_base.hpp` - `ResponseGroupData` (has `random_effect_indices`), `ConditionalContribution`
