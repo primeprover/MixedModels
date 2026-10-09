@@ -12,8 +12,6 @@ struct ResponseGroupData {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     MatrixXd X;
     VectorXd y;
-    VectorXd ZtY;
-    MatrixXd ZtX;
     MatrixXd W; // Empty for responses without a variance-design matrix.
     bool observed = true;
     std::vector<int> random_effect_indices;
@@ -30,28 +28,6 @@ struct ConditionalContribution {
     explicit ConditionalContribution(int p)
         : XtVinvX(MatrixXd::Zero(p, p)), XtVinvy(VectorXd::Zero(p)) {}
 
-    void add_group_contribution(
-        const ResponseGroupData& response_group,
-        const ResponseGroupWorkspace& response_workspace,
-        const RandomEffectsIntegrationWorkspace& integration_workspace,
-        int fixed_effect_offset,
-        int fixed_effect_dimension)
-    {
-        const MatrixXd info_block = response_group.X.transpose() * integration_workspace.VinvX;
-        const VectorXd vinvy_block = response_group.X.transpose() * integration_workspace.Vinvy;
-        XtVinvX.block(fixed_effect_offset, fixed_effect_offset, fixed_effect_dimension, fixed_effect_dimension).noalias() += info_block;
-        XtVinvy.segment(fixed_effect_offset, fixed_effect_dimension).noalias() += vinvy_block;
-        quad += response_group.y.dot(integration_workspace.Vinvy);
-        logdetV += response_workspace.logdetR + integration_workspace.logdetK;
-    }
-
-    void merge_from(const ConditionalContribution& other)
-    {
-        XtVinvX.noalias() += other.XtVinvX;
-        XtVinvy.noalias() += other.XtVinvy;
-        logdetV += other.logdetV;
-        quad += other.quad;
-    }
 };
 
 inline int total_observation_count(const std::vector<ResponseGroupData>& groups)
@@ -61,15 +37,6 @@ inline int total_observation_count(const std::vector<ResponseGroupData>& groups)
         count += static_cast<int>(group.y.size());
     return count;
 }
-
-bool accumulate_groups_response(
-    const PreparedModel& model,
-    const ResponseModel& response,
-    const MatrixXd& G_inv,
-    MatrixXd& XtVinvX,
-    VectorXd& XtVinvy,
-    double& logdetV,
-    double& quad);
 
 class ResponseModel
 {
@@ -108,8 +75,4 @@ public:
         const ResponseGroupData& response_group,
         int group_index,
         ResponseGroupWorkspace& ws) const = 0;
-    virtual VectorXd compute_beta_hat(
-        const PreparedModel& prepared,
-        const MatrixXd& G_inv,
-        const VectorXd& theta) const = 0;
 };

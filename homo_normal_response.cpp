@@ -15,8 +15,6 @@ std::vector<ResponseGroupData> extract_homo_groups(const Rcpp::List& prepared)
         Rcpp::List group_i = group_list[i];
             groups[i].X = Rcpp::as<MatrixXd>(group_i["X"]);
         groups[i].y = Rcpp::as<VectorXd>(group_i["y"]);
-        groups[i].ZtY = Rcpp::as<VectorXd>(group_i["ZtY"]);
-        groups[i].ZtX = Rcpp::as<MatrixXd>(group_i["ZtX"]);
         if (group_i.containsElementNamed("observed")) {
             groups[i].observed = Rcpp::as<bool>(group_i["observed"]);
         }
@@ -99,28 +97,6 @@ void HomoNormalResponse::compute_group(
         inv_resid_var_,
         log_resid_variance_,
         ws);
-}
-
-VectorXd HomoNormalResponse::compute_beta_hat(
-    const PreparedModel& prepared,
-    const MatrixXd& G_inv,
-    const VectorXd& theta) const
-{
-    update_working_from_theta(theta, prepared.q, prepared.n_corr, 0);
-
-    MatrixXd XtVinvX = MatrixXd::Zero(groups.front().X.cols(), groups.front().X.cols());
-    VectorXd XtVinvy = VectorXd::Zero(groups.front().X.cols());
-    double logdetV = 0.0;
-    double quad = 0.0;
-
-    if (!accumulate_groups_response(prepared, *this, G_inv, XtVinvX, XtVinvy, logdetV, quad)) {
-        Rcpp::stop("Could not accumulate response groups.");
-    }
-
-    Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
-    if (llt_XtVinvX.info() != Eigen::Success)
-        Rcpp::stop("Could not factor fixed-effects information matrix.");
-    return llt_XtVinvX.solve(XtVinvy);
 }
 
 void compute_homo_normal_group(

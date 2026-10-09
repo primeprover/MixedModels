@@ -35,10 +35,6 @@ public:
                        const ResponseGroupData& response_group,
                        int group_index,
                        ResponseGroupWorkspace& ws) const override;
-    VectorXd compute_beta_hat(
-        const PreparedModel& prepared,
-        const MatrixXd& G_inv,
-        const VectorXd& theta) const override;
 
 private:
     mutable double log_resid_variance_ = 0.0;

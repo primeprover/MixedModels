@@ -8,3 +8,5 @@ _opc_diag_tmp/*
 repomix-output.xml
 truth_theta_23.rds
 test_scripts/*
+__pycache__/*
+.Rhistory

@@ -13,8 +13,6 @@ std::vector<ResponseGroupData> extract_hetero_groups(const Rcpp::List& prepared)
         Rcpp::List group_i = group_list[i];
         groups[i].X = Rcpp::as<MatrixXd>(group_i["X"]);
         groups[i].y = Rcpp::as<VectorXd>(group_i["y"]);
-        groups[i].ZtY = Rcpp::as<VectorXd>(group_i["ZtY"]);
-        groups[i].ZtX = Rcpp::as<MatrixXd>(group_i["ZtX"]);
         groups[i].W = Rcpp::as<MatrixXd>(group_i["W"]);
         if (group_i.containsElementNamed("observed")) {
             groups[i].observed = Rcpp::as<bool>(group_i["observed"]);
@@ -110,28 +108,6 @@ void HeteroNormalResponse::compute_group(
         ws);
 }
 
-VectorXd HeteroNormalResponse::compute_beta_hat(
-    const PreparedModel& prepared,
-    const MatrixXd& G_inv,
-    const VectorXd& theta) const
-{
-    update_working_from_theta(theta, prepared.q, prepared.n_corr, 0);
-
-    MatrixXd XtVinvX = MatrixXd::Zero(groups.front().X.cols(), groups.front().X.cols());
-    VectorXd XtVinvy = VectorXd::Zero(groups.front().X.cols());
-    double logdetV = 0.0;
-    double quad = 0.0;
-
-    if (!accumulate_groups_response(prepared, *this, G_inv, XtVinvX, XtVinvy, logdetV, quad)) {
-        Rcpp::stop("Could not accumulate response groups.");
-    }
-
-    Eigen::LLT<MatrixXd> llt_XtVinvX(XtVinvX);
-    if (llt_XtVinvX.info() != Eigen::Success)
-        Rcpp::stop("Could not factor fixed-effects information matrix.");
-    return llt_XtVinvX.solve(XtVinvy);
-}
-
 void compute_hetero_normal_group(
     const GroupData& random_effects_group,
     const ResponseGroupData& response_group,
@@ -144,7 +120,7 @@ void compute_hetero_normal_group(
     
     ws.RinvZ.resize(n, q_r);
     for (int k = 0; k < q_r; ++k) {
-        int col_idx = response_group.random_effect_indices[k] - 1;
+        int col_idx = response_group.random_effect_indices[k] - 1; // R is 1-based
         if (col_idx >= 0 && col_idx < random_effects_group.Z.cols()) {
             ws.RinvZ.col(k) = random_effects_group.Z.col(col_idx);
         }

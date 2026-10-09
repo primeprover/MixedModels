@@ -14,13 +14,8 @@ struct GroupData {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   MatrixXd Z;      // design matrix for random effects
   int n;           // number of observations
-  MatrixXd ZtZ;    // Z'Z (precomputed)
 };
 
-struct ResponseRandomEffectsMap {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  std::vector<int> global_indices;
-};
 
 struct PreparedModel {
   std::vector<int> global_random_effect_sizes;
@@ -54,23 +49,4 @@ struct ResponseGroupWorkspace {
   VectorXd Rinvy;
 
   double logdetR = 0.0;
-};
-
-struct RandomEffectsIntegrationWorkspace {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  MatrixXd ZtRinvZ;
-  MatrixXd ZtRinvX;
-  VectorXd ZtRinvy;
-
-  MatrixXd K;
-  MatrixXd KinvZtRinvX;
-  VectorXd KinvZtRinvy;
-
-  MatrixXd VinvX;
-  VectorXd Vinvy;
-
-  double logdetK = 0.0;
-
-  Eigen::LLT<MatrixXd> llt;
 };

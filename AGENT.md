@@ -117,3 +117,61 @@ C:\PROGRA~1\R\R-43~1.1\bin\Rscript.exe verify_1thread.R
 (Rscript not on PATH; use the full path, or run in a persistent terminal to avoid the 30 s
 `run_command` timeout. The Rcpp DLL rebuild is slow on this machine (g++ `-g3` + Eigen);
 R buffers stdout to a redirected log until the process exits.)
+
+## Reorganization (2026-09-10) — split reml_loglik.cpp + drop dead code
+Status: **DONE** (verified below). Goal: keep `reml_loglik.cpp` to the 4 R-facing
+functions + thin glue; move internals to their own files; delete dead code.
+
+### Changes
+1. **`extract_groups` merged** — the one-line `extract_groups`/`extract_groups_from_payload`
+   pair collapsed into a single `extract_groups` (anonymous namespace at top).
+2. **`accumulate_conditional_contributions`** moved to `contribution_accumulator.cpp`
+   (declaration in `contribution_accumulator.hpp`). OpenMP kernel moved unchanged.
+3. **Matrix ops** (`robust_llt_solve`, `solve_fe`, `logdet_chol`) moved to
+   `matrix_solve_utils.hpp` (header-only, `inline`).
+   - Decision: **not merged** (unlike `extract_groups`). `solve_fe` is a meaningful
+     fixed-effects wrapper, not a forwarder; all three moved as one cohesive module.
+4. **Dead beta chain removed** (verified: response-level `compute_beta_hat` had **zero**
+   callers; R only ever calls exported `compute_beta_hat_cpp`):
+   - `ResponseModel::compute_beta_hat` virtual (response_base.hpp) removed.
+   - `HomoNormalResponse::compute_beta_hat` + `HeteroNormalResponse::compute_beta_hat`
+     (declaration + definition, both) removed.
+   - `accumulate_groups_response` (reml_loglik.cpp def + response_base.hpp decl) removed.
+   - The 4 R-facing functions + `compute_penalty` in `reml_loglik.cpp` are **verbatim**.
+
+### Follow-up (2026-10-09) - DONE:
+  - random_effects_begin/_compute/_finalize + RandomEffectsIntegrationWorkspace: REMOVED (zero live
+    callers; only the removed single-response path used them).
+  - Also removed: ResponseRandomEffectsMap, GroupData::ZtZ, ResponseGroupData::ZtX/ZtY (zero live
+    readers); ConditionalContribution::add_group_contribution + merge_from (zero callers); unused
+    G_global (inverse + try/catch, computed but never used) in accumulate_conditional_contributions.
+  - Live identifiers intact: build_random_effects_system/RandomEffectsSystem, robust_llt_solve, solve_fe,
+    logdet_chol, total_observation_count. CRLF preserved in all edited files; diagnostics clean.
+
+### Verification
+- `reml_loglik.cpp`: 253 lines (was 682). `accumulate_groups_response`, `robust_llt_solve`,
+  `extract_groups_from_payload`, `<atomic>` all absent; new includes
+  `contribution_accumulator.hpp` / `matrix_solve_utils.hpp` present.
+- The 4 R-facing funcs + `compute_penalty` intact — ordered marker check passed (all present,
+  correct order).
+- `response_base.hpp` / homo / hetero (hpp+cpp): no `compute_beta_hat` /
+  `accumulate_groups_response` remaining.
+- `contribution_accumulator.cpp` (333 lines): kernel def + `#pragma omp parallel` present;
+  `matrix_solve_utils.hpp`: 3 `inline` funcs; `contribution_accumulator.hpp`: decl present.
+- VS Code diagnostics: **no C++ errors** (only pre-existing R linter noise about
+  Rcpp-exported functions).
+
+### Env quirks (this machine)
+- Source files are **CRLF + UTF-8 BOM**. LF `oldText` in `replace_text`/`write_file` does not
+  match CRLF. Use `python -c "..."` (single line) or `write_file` + a python read-back check.
+- `python -c "multi-line string"` is **mangled by cmd.exe** (raw newlines break it). Always
+  single-line `-c`.
+- `write_file` is occasionally flaky (a 0-byte write was observed); **always verify** the
+  written file via `python -c` read-back (identifier counts / line count) after each write.
+
+### File map after reorg
+- `reml_loglik.cpp` — 4 R-facing entry points + `extract_groups` + `compute_penalty`.
+- `contribution_accumulator.{hpp,cpp}` — multi-response conditional-contribution kernel.
+- `matrix_solve_utils.hpp` — `robust_llt_solve`, `solve_fe`, `logdet_chol`.
+- `response_base.hpp` / `homo_normal_response.{hpp,cpp}` / `hetero_normal_response.{hpp,cpp}`
+  — response definitions (no more `compute_beta_hat` overrides).
