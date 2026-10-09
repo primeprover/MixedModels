@@ -647,7 +647,7 @@ fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
                              response_type = NULL,
                              residual_variance_penalty_weight = 0,
                              response_spec = NULL) {
-  engine <- match.arg(engine)
+  engine <- match.arg(engine, c("C++", "R"))
   
   fake_time <- system.time({}, gcFirst = FALSE)  # Dummy timing to avoid first-time overhead
   print(fake_time)
@@ -675,6 +675,14 @@ fit_mixed_simple <- function(formula, random, var_pred = NULL, data,
     reml_fun <- function(theta, return_penalty = FALSE) {
       reml_loglik_r(theta, prepared, return_penalty)
     }
+    # Fixed-effects are estimated by the compiled engine in both branches;
+    # initialise the model here so compute_beta_hat_cpp() below has it.
+    if (!exists("init_model_cpp")) {
+      stop("The compiled C++ engine is not available, but it is required to ",
+           "estimate fixed effects (beta). Ensure reml_loglik.cpp compiled.")
+    }
+    extract_time <- system.time(model <- init_model_cpp(prepared), gcFirst = FALSE)
+    print("Model initialized in C++ engine")
   }
   initial_values_time <- system.time( {
     theta_init <- init_theta_general(prepared)

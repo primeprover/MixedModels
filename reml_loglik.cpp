@@ -17,21 +17,34 @@
 // [[Rcpp::plugins(openmp)]]
 
 namespace {
-std::vector<GroupData> extract_groups_from_payload(const Rcpp::List& prepared) {
-  const Rcpp::List gl = prepared.containsElementNamed("shared_group_list")
-      ? prepared["shared_group_list"] : prepared.containsElementNamed("group_list")
-          ? prepared["group_list"] : Rcpp::List();
-  const int n = gl.size(); std::vector<GroupData> groups(n);
-  for (int i = 0; i < n; ++i) {
-    const Rcpp::List gi = gl[i];
-    groups[i].Z = Rcpp::as<MatrixXd>(gi["Z"]);
-    groups[i].n = Rcpp::as<int>(gi["n"]);
-    groups[i].ZtZ = Rcpp::as<MatrixXd>(gi["ZtZ"]);
+
+std::vector<GroupData> extract_groups_from_payload(const Rcpp::List& prepared)
+{
+  const Rcpp::List group_list = prepared.containsElementNamed("shared_group_list")
+      ? prepared["shared_group_list"]
+      : prepared.containsElementNamed("group_list")
+          ? prepared["group_list"]
+          : Rcpp::List();
+  const int n_groups = group_list.size();
+  std::vector<GroupData> groups(n_groups);
+
+  for (int i = 0; i < n_groups; ++i) {
+    const Rcpp::List group_i = group_list[i];
+    groups[i].Z = Rcpp::as<MatrixXd>(group_i["Z"]);
+    groups[i].n = Rcpp::as<int>(group_i["n"]);
+    groups[i].ZtZ = Rcpp::as<MatrixXd>(group_i["ZtZ"]);
   }
+
   return groups;
 }
+
+} // namespace
+
+std::vector<GroupData> extract_groups(const Rcpp::List& prepared)
+{
+  return extract_groups_from_payload(prepared);
 }
-std::vector<GroupData> extract_groups(const Rcpp::List& prepared) { return extract_groups_from_payload(prepared); }
+
 PreparedModel::~PreparedModel() = default;
 
 namespace {
@@ -43,12 +56,15 @@ namespace {
 // design lies in the random-effect span (X = Z). Failing gracefully (instead
 // of a hard crash) lets the optimizer steer around the ill-conditioned region.
 bool robust_llt_solve(const MatrixXd& A, const VectorXd& b,
-                      VectorXd& x, double& logdetA) {
+                      VectorXd& x, double& logdetA)
+{
   const int n = A.rows();
   double maxdiag = 0.0;
-  for (int i = 0; i < n; ++i) maxdiag = std::max(maxdiag, std::fabs(A(i, i)));
+  for (int i = 0; i < n; ++i) {
+    maxdiag = std::max(maxdiag, std::fabs(A(i, i)));
+  }
   const double scale = std::max<double>(1.0, maxdiag);
-  const double jitter[7] = {0.0, 1e-8, 1e-6, 1e-4, 1e-2, 1.0, 1e2};
+  const double jitter[7] = { 0.0, 1e-8, 1e-6, 1e-4, 1e-2, 1.0, 1e2 };
   for (int k = 0; k < 7; ++k) {
     MatrixXd A2 = A;
     if (jitter[k] > 0.0) {
@@ -66,117 +82,188 @@ bool robust_llt_solve(const MatrixXd& A, const VectorXd& b,
   return false;
 }
 
-VectorXd solve_fe(const MatrixXd& XtVinvX, const VectorXd& XtVinvy, bool& success) {
-  VectorXd x; double ld;
+VectorXd solve_fe(const MatrixXd& XtVinvX, const VectorXd& XtVinvy, bool& success)
+{
+  VectorXd x;
+  double ld;
   success = robust_llt_solve(XtVinvX, XtVinvy, x, ld);
   return x;
 }
-double logdet_chol(const MatrixXd& X, bool& success) {
+
+double logdet_chol(const MatrixXd& X, bool& success)
+{
   const int n = X.rows();
   const VectorXd zero = VectorXd::Zero(n);
-  VectorXd dummy; double ld;
+  VectorXd dummy;
+  double ld;
   success = robust_llt_solve(X, zero, dummy, ld);
   return ld;
 }
-}
+
+} // namespace
 
 // [[Rcpp::export]]
-Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared) {
+Rcpp::XPtr<PreparedModel> init_model_cpp(const Rcpp::List& prepared)
+{
   auto model = new PreparedModel();
-  model->q=prepared["q"]; model->n_corr=prepared["n_corr"];
-  model->lo_sigma=prepared["lo_sigma"]; model->hi_sigma=prepared["hi_sigma"];
-  model->residual_variance_penalty_weight = prepared.containsElementNamed("residual_variance_penalty_weight")
-      ? Rcpp::as<double>(prepared["residual_variance_penalty_weight"]) : 0.0;
-  if (model->residual_variance_penalty_weight < 0.0) Rcpp::stop("penalty must be non-negative.");
+  model->q = prepared["q"];
+  model->n_corr = prepared["n_corr"];
+  model->lo_sigma = prepared["lo_sigma"];
+  model->hi_sigma = prepared["hi_sigma"];
+  model->residual_variance_penalty_weight =
+      prepared.containsElementNamed("residual_variance_penalty_weight")
+          ? Rcpp::as<double>(prepared["residual_variance_penalty_weight"])
+          : 0.0;
+  if (model->residual_variance_penalty_weight < 0.0)
+    Rcpp::stop("penalty must be non-negative.");
   model->groups = extract_groups(prepared);
   if (prepared.containsElementNamed("response_spec")) {
-    const Rcpp::List rs = prepared["response_spec"];
-    if (rs.containsElementNamed("random_map")) {
-      const Rcpp::IntegerVector rm = rs["random_map"];
-      model->global_random_effect_sizes.assign(rm.begin(), rm.end());
-      model->global_random_effect_offsets.assign(rm.size(), 0);
+    const Rcpp::List response_spec = prepared["response_spec"];
+    if (response_spec.containsElementNamed("random_map")) {
+      const Rcpp::IntegerVector random_map = response_spec["random_map"];
+      model->global_random_effect_sizes.assign(random_map.begin(), random_map.end());
+      model->global_random_effect_offsets.assign(random_map.size(), 0);
     }
   }
   if (prepared.containsElementNamed("responses")) {
-    const Rcpp::List res = prepared["responses"];
-    int po=0, fo=0;
-    for (int i=0;i<res.size();++i) {
-      auto r = make_response(res[i]);
-      r->initialise_from_prepared(res[i]);
-      r->set_parameter_offset(po); r->set_fixed_effect_offset(fo);
-      r->initialise_working();
-      po+=r->parameter_count(); fo+=r->fixed_effect_dimension();
-      model->responses.push_back(std::move(r));
+    const Rcpp::List responses = prepared["responses"];
+    int parameter_offset = 0;
+    int fixed_effect_offset = 0;
+    for (int i = 0; i < responses.size(); ++i) {
+      const Rcpp::List response_prepared = responses[i];
+      auto response = make_response(response_prepared);
+      response->initialise_from_prepared(response_prepared);
+      response->set_parameter_offset(parameter_offset);
+      response->set_fixed_effect_offset(fixed_effect_offset);
+      response->initialise_working();
+      parameter_offset += response->parameter_count();
+      fixed_effect_offset += response->fixed_effect_dimension();
+      model->responses.push_back(std::move(response));
     }
   } else {
-    auto r = make_response(prepared);
-    r->initialise_from_prepared(prepared); r->initialise_working();
-    model->responses.push_back(std::move(r));
+    auto response = make_response(prepared);
+    response->initialise_from_prepared(prepared);
+    response->initialise_working();
+    model->responses.push_back(std::move(response));
   }
   return Rcpp::XPtr<PreparedModel>(model, true);
 }
 
-double compute_penalty(const PreparedModel& model, const VectorXd& log_sds, const ResponseModel& response) {
-  double p=0.0;
-  for (int i=0;i<model.q;++i) {
-    p+=std::max(0.0,log_sds(i)-model.hi_sigma)*std::max(0.0,log_sds(i)-model.hi_sigma)
-      +std::max(0.0,model.lo_sigma-log_sds(i))*std::max(0.0,model.lo_sigma-log_sds(i))
-      +log_sds(i)*log_sds(i)*10000.0;
+double compute_penalty(
+    const PreparedModel& model,
+    const VectorXd& log_sds,
+    const ResponseModel& response)
+{
+  double penalty = 0.0;
+  for (int i = 0; i < model.q; ++i) {
+    const double excess_hi = std::max(0.0, log_sds(i) - model.hi_sigma);
+    const double excess_lo = std::max(0.0, model.lo_sigma - log_sds(i));
+    penalty += excess_hi * excess_hi + excess_lo * excess_lo
+        + log_sds(i) * log_sds(i) * 10000.0;
   }
-  return p*1e-6 + model.residual_variance_penalty_weight*response.residual_variance_penalty();
+  return penalty * 1e-6 + model.residual_variance_penalty_weight
+      * response.residual_variance_penalty();
 }
 
-bool accumulate_groups_response(const PreparedModel& model, const ResponseModel& response,
-    const MatrixXd& G_inv, MatrixXd& XtVinvX, VectorXd& XtVinvy, double& logdetV, double& quad) {
+bool accumulate_groups_response(
+    const PreparedModel& model,
+    const ResponseModel& response,
+    const MatrixXd& G_inv,
+    MatrixXd& XtVinvX,
+    VectorXd& XtVinvy,
+    double& logdetV,
+    double& quad)
+{
   Eigen::setNbThreads(1);
-  const auto& groups=model.groups; const int p=response.fixed_effect_dimension();
-  ConditionalContribution contribution(p); std::atomic<bool> bad(false);
-  { ConditionalContribution lc(p); ResponseGroupWorkspace rw; RandomEffectsIntegrationWorkspace iw;
-    for (int ig=0;ig<(int)groups.size();++ig) {
-      const auto& g=groups[ig]; const auto& rg=response.groups[ig];
-      if (!rg.observed) continue;
-      response.compute_group(g, rg, ig, rw);
-      if (!random_effects_compute(g, G_inv, rw, iw)) { bad.store(true,std::memory_order_relaxed); continue; }
-      lc.add_group_contribution(rg,rw,iw,response.fixed_effect_offset(),response.fixed_effect_dimension());
+  const auto& groups = model.groups;
+  const int p = response.fixed_effect_dimension();
+  ConditionalContribution contribution(p);
+  std::atomic<bool> bad(false);
+  {
+    ConditionalContribution local_contribution(p);
+    ResponseGroupWorkspace response_workspace;
+    RandomEffectsIntegrationWorkspace integration_workspace;
+    for (int ig = 0; ig < (int)groups.size(); ++ig) {
+      const auto& group = groups[ig];
+      const auto& response_group = response.groups[ig];
+      if (!response_group.observed) {
+        continue;
+      }
+      response.compute_group(group, response_group, ig, response_workspace);
+      if (!random_effects_compute(group, G_inv, response_workspace, integration_workspace)) {
+        bad.store(true, std::memory_order_relaxed);
+        continue;
+      }
+      local_contribution.add_group_contribution(
+          response_group, response_workspace, integration_workspace,
+          response.fixed_effect_offset(), response.fixed_effect_dimension());
     }
-    { contribution.merge_from(lc); }
+    contribution.merge_from(local_contribution);
   }
-  XtVinvX=contribution.XtVinvX; XtVinvy=contribution.XtVinvy;
-  logdetV=contribution.logdetV; quad=contribution.quad;
+  XtVinvX = contribution.XtVinvX;
+  XtVinvy = contribution.XtVinvy;
+  logdetV = contribution.logdetV;
+  quad = contribution.quad;
   return !bad.load();
 }
 
 // ============================================================
 // MULTI-RESPONSE: Full cross-response coupling via Woodbury identity
 // ============================================================
-bool accumulate_conditional_contributions(const PreparedModel& model,
-    const MatrixXd& G_inv_global, ConditionalContribution& contribution) {
-  if (model.responses.empty()) return false;
-  int P_total=0;
-  for (const auto& r:model.responses) P_total+=r->fixed_effect_dimension();
-  if (P_total<=0) return false;
+bool accumulate_conditional_contributions(
+    const PreparedModel& model,
+    const MatrixXd& G_inv_global,
+    ConditionalContribution& contribution)
+{
+  if (model.responses.empty()) {
+    return false;
+  }
+
+  int P_total = 0;
+  for (const auto& resp : model.responses) {
+    P_total += resp->fixed_effect_dimension();
+  }
+  if (P_total <= 0) {
+    return false;
+  }
+
   contribution = ConditionalContribution(P_total);
-  const auto& groups=model.groups; bool bad=false;
+  const auto& groups = model.groups;
+  bool bad = false;
+
   MatrixXd G_global;
   if (G_inv_global.size() > 0) {
-    try { G_global = G_inv_global.inverse(); } catch (...) { G_global = MatrixXd(); }
+    try {
+      G_global = G_inv_global.inverse();
+    } catch (...) {
+      G_global = MatrixXd();
+    }
   }
+
   Eigen::setNbThreads(1);
   #pragma omp parallel
   {
-    ConditionalContribution lc(P_total);
-    std::vector<ResponseGroupWorkspace> rws(model.responses.size());
-    std::vector<MatrixXd> Mr(model.responses.size());
-    std::vector<VectorXd> Br(model.responses.size());
+    ConditionalContribution local_contribution(P_total);
+    std::vector<ResponseGroupWorkspace> response_workspaces(model.responses.size());
+    std::vector<MatrixXd> M_r(model.responses.size());
+    std::vector<VectorXd> B_r(model.responses.size());
     bool bad_local = false;
-    MatrixXd lXtRX(P_total,P_total); lXtRX.setZero();
-    VectorXd lXtRy(P_total); lXtRy.setZero();
-    MatrixXd lCdiag(P_total,P_total); lCdiag.setZero();
-    VectorXd lc_vec(P_total); lc_vec.setZero();
-    MatrixXd lCross(P_total,P_total); lCross.setZero();
+
+    MatrixXd lXtRX(P_total, P_total);
+    lXtRX.setZero();
+    VectorXd lXtRy(P_total);
+    lXtRy.setZero();
+    MatrixXd lCdiag(P_total, P_total);
+    lCdiag.setZero();
+    VectorXd lc_vec(P_total);
+    lc_vec.setZero();
+    MatrixXd lCross(P_total, P_total);
+    lCross.setZero();
+
     #pragma omp for schedule(dynamic, 1)
-    for (int ig=0;ig<(int)groups.size();++ig) {
-      const auto& g=groups[ig];
+    for (int ig = 0; ig < (int)groups.size(); ++ig) {
+      const auto& group = groups[ig];
+
       {
         // OBS_SPACE DISABLED: single-response ("long") models now fall through to the
         // general Schur-complement path below (identical to the multi-response path).
@@ -192,184 +279,308 @@ bool accumulate_conditional_contributions(const PreparedModel& model,
         if (obs_space) {
           const auto& resp = *model.responses[0];
           const ResponseGroupData& rg = resp.groups[ig];
-          if (!rg.observed) continue;
-          resp.compute_group(g, rg, ig, rws[0]);
+          if (!rg.observed) {
+            continue;
+          }
+          resp.compute_group(group, rg, ig, response_workspaces[0]);
           const MatrixXd& X = rg.X;
           const VectorXd& y = rg.y;
           const int n = (int)y.size();
-          const MatrixXd& RinvX = rws[0].RinvX;
+          const MatrixXd& RinvX = response_workspaces[0].RinvX;
           VectorXd inv_var(n);
-          for (int i=0;i<n;++i) {
-            bool found=false;
-            for (int j=0;j<(int)X.cols();++j) {
-              if (std::fabs(X(i,j)) > 1e-14) { inv_var(i) = RinvX(i,j)/X(i,j); found=true; break; }
+          for (int i = 0; i < n; ++i) {
+            bool found = false;
+            for (int j = 0; j < (int)X.cols(); ++j) {
+              if (std::fabs(X(i, j)) > 1e-14) {
+                inv_var(i) = RinvX(i, j) / X(i, j);
+                found = true;
+                break;
+              }
             }
-            if (!found) inv_var(i) = 1.0;
+            if (!found) {
+              inv_var(i) = 1.0;
+            }
           }
-          MatrixXd V = MatrixXd::Zero(n,n);
-          for (int i=0;i<n;++i) V(i,i) = inv_var(i);
-          V.noalias() += g.Z * G_global * g.Z.transpose();
+          MatrixXd V = MatrixXd::Zero(n, n);
+          for (int i = 0; i < n; ++i) {
+            V(i, i) = inv_var(i);
+          }
+          V.noalias() += group.Z * G_global * group.Z.transpose();
           Eigen::LLT<MatrixXd> lltV(V);
-          if (lltV.info() != Eigen::Success) { bad_local = true; continue; }
-          MatrixXd Vinv = lltV.solve(MatrixXd::Identity(n,n));
-          lc.logdetV += 2.0*lltV.matrixLLT().diagonal().array().log().sum();
+          if (lltV.info() != Eigen::Success) {
+            bad_local = true;
+            continue;
+          }
+          MatrixXd Vinv = lltV.solve(MatrixXd::Identity(n, n));
+          local_contribution.logdetV +=
+              2.0 * lltV.matrixLLT().diagonal().array().log().sum();
           MatrixXd VinvX = Vinv * X;
           VectorXd Vinvy = Vinv * y;
-          lc.quad += y.dot(Vinvy);
+          local_contribution.quad += y.dot(Vinvy);
           lXtRX.noalias() += X.transpose() * VinvX;
           lXtRy.noalias() += X.transpose() * Vinvy;
           continue;
         }
       }
-      MatrixXd sZtRZ(model.q,model.q); sZtRZ.setZero();
-      for (int ir=0;ir<(int)model.responses.size();++ir) {
-        const ResponseModel& resp=*model.responses[ir];
-        const ResponseGroupData& rg=resp.groups[ig];
-        if (!rg.observed) continue;
-        resp.compute_group(g,rg,ig,rws[ir]);
-        int Q=rg.random_effect_indices.size();
-        MatrixXd Zr(g.Z.rows(),Q);
-        for (int k=0;k<Q;++k) { int idx=rg.random_effect_indices[k]-1;
-          if (idx>=0&&idx<g.Z.cols()) Zr.col(k)=g.Z.col(idx); }
-        MatrixXd blk=Zr.transpose()*rws[ir].RinvZ;
-        for (int i=0;i<Q;++i) { int gi=rg.random_effect_indices[i]-1;
-          for (int j=0;j<=i;++j) { int gj=rg.random_effect_indices[j]-1;
-            if (gi>=0&&gj>=0&&gi<model.q&&gj<model.q) {
-              sZtRZ(gi,gj)+=blk(i,j); if(i!=j) sZtRZ(gj,gi)+=blk(i,j); } } } }
-      MatrixXd K=G_inv_global+sZtRZ; Eigen::LLT<MatrixXd> llt(K);
-      if (llt.info()!=Eigen::Success) { bad_local=true; continue; }
-      double logdetK=2.0*llt.matrixLLT().diagonal().array().log().sum();
-      MatrixXd Kinv=llt.solve(MatrixXd::Identity(model.q,model.q));
 
-      int nor=0;
-      for (int ir=0;ir<(int)model.responses.size();++ir) {
-        const ResponseModel& resp=*model.responses[ir];
-        const ResponseGroupData& rg=resp.groups[ig];
-        if (!rg.observed) continue;
-        ++nor;
-        int Q=rg.random_effect_indices.size();
-        MatrixXd Zr(g.Z.rows(),Q);
-        for (int k=0;k<Q;++k) { int idx=rg.random_effect_indices[k]-1;
-          if (idx>=0&&idx<g.Z.cols()) Zr.col(k)=g.Z.col(idx); }
-        Mr[ir].noalias()=rg.X.transpose()*rws[ir].RinvZ;
-        Br[ir].noalias()=Zr.transpose()*rws[ir].Rinvy;
-        lc.logdetV+=rws[ir].logdetR;
-        lc.quad+=rg.y.dot(rws[ir].Rinvy);
+      MatrixXd sZtRZ(model.q, model.q);
+      sZtRZ.setZero();
+      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+        const ResponseModel& resp = *model.responses[ir];
+        const ResponseGroupData& rg = resp.groups[ig];
+        if (!rg.observed) {
+          continue;
+        }
+        resp.compute_group(group, rg, ig, response_workspaces[ir]);
+        const int Q = (int)rg.random_effect_indices.size();
+        MatrixXd Zr(group.Z.rows(), Q);
+        for (int k = 0; k < Q; ++k) {
+          const int idx = rg.random_effect_indices[k] - 1;
+          if (idx >= 0 && idx < group.Z.cols()) {
+            Zr.col(k) = group.Z.col(idx);
+          }
+        }
+        MatrixXd blk = Zr.transpose() * response_workspaces[ir].RinvZ;
+        for (int i = 0; i < Q; ++i) {
+          const int gi = rg.random_effect_indices[i] - 1;
+          for (int j = 0; j <= i; ++j) {
+            const int gj = rg.random_effect_indices[j] - 1;
+            if (gi >= 0 && gj >= 0 && gi < model.q && gj < model.q) {
+              sZtRZ(gi, gj) += blk(i, j);
+              if (i != j) {
+                sZtRZ(gj, gi) += blk(i, j);
+              }
+            }
+          }
+        }
       }
-      lc.logdetV+=logdetK;
+
+      MatrixXd K = G_inv_global + sZtRZ;
+      Eigen::LLT<MatrixXd> llt(K);
+      if (llt.info() != Eigen::Success) {
+        bad_local = true;
+        continue;
+      }
+      double logdetK = 2.0 * llt.matrixLLT().diagonal().array().log().sum();
+      MatrixXd Kinv = llt.solve(MatrixXd::Identity(model.q, model.q));
+
+      int nor = 0;
+      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+        const ResponseModel& resp = *model.responses[ir];
+        const ResponseGroupData& rg = resp.groups[ig];
+        if (!rg.observed) {
+          continue;
+        }
+        ++nor;
+        const int Q = (int)rg.random_effect_indices.size();
+        MatrixXd Zr(group.Z.rows(), Q);
+        for (int k = 0; k < Q; ++k) {
+          const int idx = rg.random_effect_indices[k] - 1;
+          if (idx >= 0 && idx < group.Z.cols()) {
+            Zr.col(k) = group.Z.col(idx);
+          }
+        }
+        M_r[ir].noalias() = rg.X.transpose() * response_workspaces[ir].RinvZ;
+        B_r[ir].noalias() = Zr.transpose() * response_workspaces[ir].Rinvy;
+        local_contribution.logdetV += response_workspaces[ir].logdetR;
+        local_contribution.quad += rg.y.dot(response_workspaces[ir].Rinvy);
+      }
+      local_contribution.logdetV += logdetK;
 
       // Assemble Mt: each response contributes its Mr at the correct global rows
-      MatrixXd Mt(model.q,P_total); Mt.setZero();
-      VectorXd Bt_vec(model.q); Bt_vec.setZero();
-      for (int ir=0;ir<(int)model.responses.size();++ir) {
-        const ResponseModel& resp=*model.responses[ir];
-        const ResponseGroupData& rg=resp.groups[ig];
-        if (!rg.observed) continue;
-        int Q=rg.random_effect_indices.size(), pr=resp.fixed_effect_dimension();
-        for (int k=0;k<Q;++k) { int gi=rg.random_effect_indices[k]-1;
-          if (gi>=0&&gi<model.q) Mt.row(gi).segment(resp.fixed_effect_offset(),pr)=Mr[ir].col(k).transpose(); }
-        for (int k=0;k<Q;++k) { int gi=rg.random_effect_indices[k]-1;
-          if (gi>=0&&gi<model.q) Bt_vec(gi)=Br[ir](k); } }
-      MatrixXd gf=llt.solve(Mt); VectorXd zf=llt.solve(Bt_vec);
-      MatrixXd Cg=Mt.transpose()*gf; VectorXd cg=Mt.transpose()*zf;
+      MatrixXd Mt(model.q, P_total);
+      Mt.setZero();
+      VectorXd Bt_vec(model.q);
+      Bt_vec.setZero();
+      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+        const ResponseModel& resp = *model.responses[ir];
+        const ResponseGroupData& rg = resp.groups[ig];
+        if (!rg.observed) {
+          continue;
+        }
+        const int Q = (int)rg.random_effect_indices.size();
+        const int pr = resp.fixed_effect_dimension();
+        for (int k = 0; k < Q; ++k) {
+          const int gi = rg.random_effect_indices[k] - 1;
+          if (gi >= 0 && gi < model.q) {
+            Mt.row(gi).segment(resp.fixed_effect_offset(), pr) =
+                M_r[ir].col(k).transpose();
+          }
+        }
+        for (int k = 0; k < Q; ++k) {
+          const int gi = rg.random_effect_indices[k] - 1;
+          if (gi >= 0 && gi < model.q) {
+            Bt_vec(gi) = B_r[ir](k);
+          }
+        }
+      }
+      MatrixXd gf = llt.solve(Mt);
+      VectorXd zf = llt.solve(Bt_vec);
+      MatrixXd Cg = Mt.transpose() * gf;
+      VectorXd cg = Mt.transpose() * zf;
 
       // Accumulate diagonal blocks of X^T R^{-1} X
-      for (int ir=0;ir<(int)model.responses.size();++ir) {
-        const ResponseModel& resp=*model.responses[ir];
-        const ResponseGroupData& rg=resp.groups[ig];
-        if (!rg.observed) continue;
-        int pr=resp.fixed_effect_dimension(), off=resp.fixed_effect_offset();
-        lXtRX.block(off,off,pr,pr).noalias()+=rg.X.transpose()*rws[ir].RinvX;
-        lXtRy.segment(off,pr).noalias()+=rg.X.transpose()*rws[ir].Rinvy;
+      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+        const ResponseModel& resp = *model.responses[ir];
+        const ResponseGroupData& rg = resp.groups[ig];
+        if (!rg.observed) {
+          continue;
+        }
+        const int pr = resp.fixed_effect_dimension();
+        const int off = resp.fixed_effect_offset();
+        lXtRX.block(off, off, pr, pr).noalias() +=
+            rg.X.transpose() * response_workspaces[ir].RinvX;
+        lXtRy.segment(off, pr).noalias() +=
+            rg.X.transpose() * response_workspaces[ir].Rinvy;
       }
       // Accumulate diagonal Woodbury correction
-      for (int ir=0;ir<(int)model.responses.size();++ir) {
-        const ResponseModel& resp=*model.responses[ir];
-        int pr=resp.fixed_effect_dimension(), off=resp.fixed_effect_offset();
-        lCdiag.block(off,off,pr,pr).noalias()+=Cg.block(off,off,pr,pr);
+      for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+        const ResponseModel& resp = *model.responses[ir];
+        const int pr = resp.fixed_effect_dimension();
+        const int off = resp.fixed_effect_offset();
+        lCdiag.block(off, off, pr, pr).noalias() += Cg.block(off, off, pr, pr);
       }
-      lc_vec.noalias()+=cg;
+      lc_vec.noalias() += cg;
 
       // Cross-response Woodbury corrections
       // For conditionally independent responses, X_a^T R^{-1} X_b = 0
       // So off-diagonal block = -M_a^T K^{-1} M_b
-      int off_a=0;
-      for (int ia=0;ia<(int)model.responses.size();++ia) {
-        const ResponseModel& resa=*model.responses[ia];
-        const ResponseGroupData& rga=resa.groups[ig];
-        if (!rga.observed) continue;
-        int pra=resa.fixed_effect_dimension();
-        MatrixXd Mta=MatrixXd::Zero(model.q,pra);
-        for (int k=0;k<(int)rga.random_effect_indices.size();++k) {
-          int gi=rga.random_effect_indices[k]-1;
-          if(gi<0||gi>=model.q) continue;
-          Mta.row(gi).segment(0,pra)=Mr[ia].col(k).transpose(); }
-        for (int ib=ia+1;ib<(int)model.responses.size();++ib) {
-          const ResponseModel& resb=*model.responses[ib];
-          const ResponseGroupData& rgb=resb.groups[ig];
-          if (!rgb.observed) continue;
-          int prb=resb.fixed_effect_dimension();
-          MatrixXd Mtb=MatrixXd::Zero(model.q,prb);
-          for (int k=0;k<(int)rgb.random_effect_indices.size();++k) {
-            int gi=rgb.random_effect_indices[k]-1;
-            if(gi<0||gi>=model.q) continue;
-            Mtb.row(gi).segment(0,prb)=Mr[ib].col(k).transpose(); }
-          MatrixXd cross=Mta.transpose()*Kinv*Mtb;
-          lCross.block(off_a,off_a+pra,pra,prb).noalias()+=cross;
-          lCross.block(off_a+pra,off_a,prb,pra).noalias()+=cross.transpose();
+      int off_a = 0;
+      for (int ia = 0; ia < (int)model.responses.size(); ++ia) {
+        const ResponseModel& resa = *model.responses[ia];
+        const ResponseGroupData& rga = resa.groups[ig];
+        if (!rga.observed) {
+          continue;
         }
-        off_a+=pra;
+        const int pra = resa.fixed_effect_dimension();
+        MatrixXd Mta = MatrixXd::Zero(model.q, pra);
+        for (int k = 0; k < (int)rga.random_effect_indices.size(); ++k) {
+          const int gi = rga.random_effect_indices[k] - 1;
+          if (gi < 0 || gi >= model.q) {
+            continue;
+          }
+          Mta.row(gi).segment(0, pra) = M_r[ia].col(k).transpose();
+        }
+        for (int ib = ia + 1; ib < (int)model.responses.size(); ++ib) {
+          const ResponseModel& resb = *model.responses[ib];
+          const ResponseGroupData& rgb = resb.groups[ig];
+          if (!rgb.observed) {
+            continue;
+          }
+          const int prb = resb.fixed_effect_dimension();
+          MatrixXd Mtb = MatrixXd::Zero(model.q, prb);
+          for (int k = 0; k < (int)rgb.random_effect_indices.size(); ++k) {
+            const int gi = rgb.random_effect_indices[k] - 1;
+            if (gi < 0 || gi >= model.q) {
+              continue;
+            }
+            Mtb.row(gi).segment(0, prb) = M_r[ib].col(k).transpose();
+          }
+          MatrixXd cross = Mta.transpose() * Kinv * Mtb;
+          lCross.block(off_a, off_a + pra, pra, prb).noalias() += cross;
+          lCross.block(off_a + pra, off_a, prb, pra).noalias() += cross.transpose();
+        }
+        off_a += pra;
       }
 
       // Bug 3: Full quadratic form
-      if (nor>1) {
-        double bkb=0.0;
-        for (int ir=0;ir<(int)model.responses.size();++ir) {
-          if (!model.responses[ir]->groups[ig].observed) continue;
-          const VectorXd& B1=Br[ir]; if(B1.size()==0) continue;
-          for (int is=0;is<(int)model.responses.size();++is) {
-            if (!model.responses[is]->groups[ig].observed) continue;
-            const VectorXd& B2=Br[is]; if(B2.size()==0) continue;
-            double t=0.0;
-            for (int ki=0;ki<B1.size();++ki) { int gi=model.responses[ir]->groups[ig].random_effect_indices[ki]-1;
-              if(gi<0||gi>=model.q) continue;
-              for (int kj=0;kj<B2.size();++kj) { int gj=model.responses[is]->groups[ig].random_effect_indices[kj]-1;
-                if(gj<0||gj>=model.q) continue;
-                t+=B1(ki)*Kinv(gi,gj)*B2(kj); } }
-            if(ir==is) bkb+=t; else if(ir<is) bkb+=2.0*t; } }
-        lc.quad-=bkb;
-      } else if (nor==1) {
-        for (int ir=0;ir<(int)model.responses.size();++ir) {
-          if (!model.responses[ir]->groups[ig].observed) continue;
-          const VectorXd& B=Br[ir]; if(B.size()==0) continue;
-          double t=0.0;
-          for (int ki=0;ki<B.size();++ki) { int gi=model.responses[ir]->groups[ig].random_effect_indices[ki]-1;
-            if(gi<0||gi>=model.q) continue;
-            for (int kj=0;kj<B.size();++kj) { int gj=model.responses[ir]->groups[ig].random_effect_indices[kj]-1;
-              if(gj<0||gj>=model.q) continue;
-              t+=B(ki)*Kinv(gi,gj)*B(kj); } }
-          lc.quad-=t; break; } }
+      if (nor > 1) {
+        double bkb = 0.0;
+        for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+          if (!model.responses[ir]->groups[ig].observed) {
+            continue;
+          }
+          const VectorXd& B1 = B_r[ir];
+          if (B1.size() == 0) {
+            continue;
+          }
+          for (int is_ = 0; is_ < (int)model.responses.size(); ++is_) {
+            if (!model.responses[is_]->groups[ig].observed) {
+              continue;
+            }
+            const VectorXd& B2 = B_r[is_];
+            if (B2.size() == 0) {
+              continue;
+            }
+            double t = 0.0;
+            for (int ki = 0; ki < (int)B1.size(); ++ki) {
+              const int gi = model.responses[ir]->groups[ig].random_effect_indices[ki] - 1;
+              if (gi < 0 || gi >= model.q) {
+                continue;
+              }
+              for (int kj = 0; kj < (int)B2.size(); ++kj) {
+                const int gj = model.responses[is_]->groups[ig].random_effect_indices[kj] - 1;
+                if (gj < 0 || gj >= model.q) {
+                  continue;
+                }
+                t += B1(ki) * Kinv(gi, gj) * B2(kj);
+              }
+            }
+            if (ir == is_) {
+              bkb += t;
+            } else if (ir < is_) {
+              bkb += 2.0 * t;
+            }
+          }
+        }
+        local_contribution.quad -= bkb;
+      } else if (nor == 1) {
+        for (int ir = 0; ir < (int)model.responses.size(); ++ir) {
+          if (!model.responses[ir]->groups[ig].observed) {
+            continue;
+          }
+          const VectorXd& B = B_r[ir];
+          if (B.size() == 0) {
+            continue;
+          }
+          double t = 0.0;
+          for (int ki = 0; ki < (int)B.size(); ++ki) {
+            const int gi = model.responses[ir]->groups[ig].random_effect_indices[ki] - 1;
+            if (gi < 0 || gi >= model.q) {
+              continue;
+            }
+            for (int kj = 0; kj < (int)B.size(); ++kj) {
+              const int gj = model.responses[ir]->groups[ig].random_effect_indices[kj] - 1;
+              if (gj < 0 || gj >= model.q) {
+                continue;
+              }
+              t += B(ki) * Kinv(gi, gj) * B(kj);
+            }
+          }
+          local_contribution.quad -= t;
+          break;
+        }
+      }
     }
+
     #pragma omp critical
     {
-      contribution.logdetV += lc.logdetV;
-      if (bad_local) bad = true;
-      contribution.quad += lc.quad;
+      contribution.logdetV += local_contribution.logdetV;
+      if (bad_local) {
+        bad = true;
+      }
+      contribution.quad += local_contribution.quad;
       // Diagonal blocks: X^T R^{-1} X - Cg(diag)
-      for (size_t ir=0;ir<model.responses.size();++ir) {
-        const auto& resp=*model.responses[ir];
-        int pr=resp.fixed_effect_dimension(), off=resp.fixed_effect_offset();
-        contribution.XtVinvX.block(off,off,pr,pr).noalias() += (lXtRX.block(off,off,pr,pr) - lCdiag.block(off,off,pr,pr));
+      for (size_t ir = 0; ir < model.responses.size(); ++ir) {
+        const auto& resp = *model.responses[ir];
+        const int pr = resp.fixed_effect_dimension();
+        const int off = resp.fixed_effect_offset();
+        contribution.XtVinvX.block(off, off, pr, pr).noalias() +=
+            lXtRX.block(off, off, pr, pr) - lCdiag.block(off, off, pr, pr);
       }
       // Off-diagonal blocks: -M_a^T K^{-1} M_b = -lCross
-      for (size_t ia=0;ia<model.responses.size();++ia) {
-        const auto& resa=*model.responses[ia];
-        int pra=resa.fixed_effect_dimension(), offa=resa.fixed_effect_offset();
-        for (size_t ib=ia+1;ib<model.responses.size();++ib) {
-          const auto& resb=*model.responses[ib];
-          int prb=resb.fixed_effect_dimension(), offb=resb.fixed_effect_offset();
-          contribution.XtVinvX.block(offa,offb,pra,prb).noalias() += (-lCross.block(offa,offb,pra,prb));
-          contribution.XtVinvX.block(offb,offa,prb,pra).noalias() += (-lCross.block(offb,offa,prb,pra));
+      for (size_t ia = 0; ia < model.responses.size(); ++ia) {
+        const auto& resa = *model.responses[ia];
+        const int pra = resa.fixed_effect_dimension();
+        const int offa = resa.fixed_effect_offset();
+        for (size_t ib = ia + 1; ib < model.responses.size(); ++ib) {
+          const auto& resb = *model.responses[ib];
+          const int prb = resb.fixed_effect_dimension();
+          const int offb = resb.fixed_effect_offset();
+          contribution.XtVinvX.block(offa, offb, pra, prb).noalias() +=
+              -lCross.block(offa, offb, pra, prb);
+          contribution.XtVinvX.block(offb, offa, prb, pra).noalias() +=
+              -lCross.block(offb, offa, prb, pra);
         }
       }
       contribution.XtVinvy.noalias() += (lXtRy - lc_vec);
@@ -381,84 +592,145 @@ bool accumulate_conditional_contributions(const PreparedModel& model,
 // ============================================================
 // MAIN
 // ============================================================
+
 // [[Rcpp::export]]
-Rcpp::List reml_loglik_cpp_impl(Rcpp::XPtr<PreparedModel> model_xptr,
-    const Eigen::VectorXd& theta_raw, bool return_penalty, bool return_timing) {
-  PreparedModel& model=*model_xptr;
-  auto t0=std::chrono::high_resolution_clock::now();
-  const int qg=model.q, nc=model.n_corr, ro=qg+nc;
-  if (model.responses.empty()) Rcpp::stop("Need at least one response.");
-  int p=0, tp=0;
-  for (const auto& rp:model.responses) { const ResponseModel& r=*rp;
-    tp+=r.parameter_count(); p+=r.fixed_effect_dimension(); }
-  if (theta_raw.size()!=ro+tp) Rcpp::stop("theta size mismatch.");
+Rcpp::List reml_loglik_cpp_impl(
+    Rcpp::XPtr<PreparedModel> model_xptr,
+    const Eigen::VectorXd& theta_raw,
+    bool return_penalty,
+    bool return_timing)
+{
+  PreparedModel& model = *model_xptr;
+  auto t0 = std::chrono::high_resolution_clock::now();
+  const int qg = model.q;
+  const int nc = model.n_corr;
+  const int ro = qg + nc;
 
-  VectorXd log_sds=theta_raw.head(qg);
-  VectorXd cuc=theta_raw.segment(qg,nc);
-  for (const auto& rp:model.responses) { ResponseModel& r=*rp;
-    r.update_working_from_theta(theta_raw,qg,nc,rp->parameter_offset());
-    if (!r.parameters_are_valid_for_theta(theta_raw,qg,nc,rp->parameter_offset())) return bad_result(); }
-  VectorXd corrs=cuc.array().tanh().matrix();
-  if ((corrs.array().abs()>0.9999999).any()) return bad_result();
+  if (model.responses.empty()) {
+    Rcpp::stop("Need at least one response.");
+  }
 
-  RandomEffectsSystem rs=build_random_effects_system(qg,log_sds,cuc);
-  if (rs.G_inv.size()==0) return bad_result();
-  double penalty=0.0;
-  for (const auto& rp:model.responses) penalty+=compute_penalty(model,log_sds,*rp);
-  penalty=0.0;
-  auto t1=std::chrono::high_resolution_clock::now();
-  double t_build=std::chrono::duration<double>(t1-t0).count();
+  int p = 0;
+  int total_p = 0;
+  for (const auto& rp : model.responses) {
+    const ResponseModel& r = *rp;
+    total_p += r.parameter_count();
+    p += r.fixed_effect_dimension();
+  }
+  if (theta_raw.size() != ro + total_p) {
+    Rcpp::stop("theta size mismatch.");
+  }
+
+  VectorXd log_sds = theta_raw.head(qg);
+  VectorXd cuc = theta_raw.segment(qg, nc);
+  for (const auto& rp : model.responses) {
+    ResponseModel& r = *rp;
+    r.update_working_from_theta(theta_raw, qg, nc, rp->parameter_offset());
+    if (!r.parameters_are_valid_for_theta(theta_raw, qg, nc, rp->parameter_offset())) {
+      return bad_result();
+    }
+  }
+  VectorXd corrs = cuc.array().tanh().matrix();
+  if ((corrs.array().abs() > 0.9999999).any()) {
+    return bad_result();
+  }
+
+  RandomEffectsSystem rs = build_random_effects_system(qg, log_sds, cuc);
+  if (rs.G_inv.size() == 0) {
+    return bad_result();
+  }
+
+  double penalty = 0.0;
+  for (const auto& rp : model.responses) {
+    penalty += compute_penalty(model, log_sds, *rp);
+  }
+  penalty = 0.0;
+  auto t1 = std::chrono::high_resolution_clock::now();
+  double t_build = std::chrono::duration<double>(t1 - t0).count();
 
   ConditionalContribution contribution(p);
-  if (!accumulate_conditional_contributions(model,rs.G_inv,contribution)) return bad_result();
-  auto t2=std::chrono::high_resolution_clock::now();
-  double t_groups=std::chrono::duration<double>(t2-t1).count();
-  double logdetV=contribution.logdetV+static_cast<double>(model.groups.size())*rs.logdetG;
+  if (!accumulate_conditional_contributions(model, rs.G_inv, contribution)) {
+    return bad_result();
+  }
+  auto t2 = std::chrono::high_resolution_clock::now();
+  double t_groups = std::chrono::duration<double>(t2 - t1).count();
+  double logdetV = contribution.logdetV +
+      static_cast<double>(model.groups.size()) * rs.logdetG;
 
   bool fe_ok;
-  VectorXd beta=solve_fe(contribution.XtVinvX,contribution.XtVinvy,fe_ok);
-  if (!fe_ok) return bad_result();
-  double qr=std::max(0.0,contribution.quad-beta.transpose()*contribution.XtVinvy);
+  VectorXd beta = solve_fe(contribution.XtVinvX, contribution.XtVinvy, fe_ok);
+  if (!fe_ok) {
+    return bad_result();
+  }
+  double qr = std::max(0.0, contribution.quad - beta.transpose() * contribution.XtVinvy);
 
   // BUG 1 FIX: Sum observations across ALL responses
-  int total_n=0;
-  for (const auto& rp:model.responses)
-    for (const auto& gr:rp->groups) total_n+=static_cast<int>(gr.y.size());
+  int total_n = 0;
+  for (const auto& rp : model.responses) {
+    for (const auto& gr : rp->groups) {
+      total_n += static_cast<int>(gr.y.size());
+    }
+  }
 
   bool det_ok;
-  double logdetX=logdet_chol(contribution.XtVinvX,det_ok);
-  if (!det_ok) return bad_result();
-  double ll=-0.5*(logdetV+logdetX+qr+(total_n-p)*std::log(2.0*M_PI));
-  auto t3=std::chrono::high_resolution_clock::now();
-  double t_finalize=std::chrono::duration<double>(t3-t2).count();
+  double logdetX = logdet_chol(contribution.XtVinvX, det_ok);
+  if (!det_ok) {
+    return bad_result();
+  }
+  double ll = -0.5 * (logdetV + logdetX + qr + (total_n - p) * std::log(2.0 * M_PI));
+  auto t3 = std::chrono::high_resolution_clock::now();
+  double t_finalize = std::chrono::duration<double>(t3 - t2).count();
 
   Rcpp::List result;
-  result["logLik_unpenalized"]=ll; result["logLik_penalized"]=ll-penalty; result["penalty"]=penalty;
-  if (return_timing&&return_penalty) result["timings"]=Rcpp::List::create(
-    Rcpp::Named("build_G")=t_build,Rcpp::Named("groups")=t_groups,
-    Rcpp::Named("finalize")=t_finalize,Rcpp::Named("total")=t_build+t_groups+t_finalize);
+  result["logLik_unpenalized"] = ll;
+  result["logLik_penalized"] = ll - penalty;
+  result["penalty"] = penalty;
+  if (return_timing && return_penalty) {
+    result["timings"] = Rcpp::List::create(
+        Rcpp::Named("build_G") = t_build,
+        Rcpp::Named("groups") = t_groups,
+        Rcpp::Named("finalize") = t_finalize,
+        Rcpp::Named("total") = t_build + t_groups + t_finalize);
+  }
   return result;
 }
 
 // [[Rcpp::export]]
-VectorXd compute_beta_hat_cpp(const Eigen::VectorXd& theta, Rcpp::XPtr<PreparedModel> model) {
-  PreparedModel& p=*model;
-  if (p.responses.empty()) Rcpp::stop("Need at least one response.");
-  const int ro=p.q+p.n_corr; int p_=0,tp=0;
-  for (const auto& rp:p.responses) { const ResponseModel& r=*rp;
-    tp+=r.parameter_count(); p_+=r.fixed_effect_dimension(); }
-  if (theta.size()!=ro+tp) Rcpp::stop("theta size mismatch.");
-  for (const auto& rp:p.responses) { ResponseModel& r=*rp;
-    r.update_working_from_theta(theta,p.q,p.n_corr,rp->parameter_offset()); }
-  MatrixXd L=build_cholesky(theta,p.q), G=L*L.transpose();
-  G.diagonal().array()+=1e-8; Eigen::LLT<MatrixXd> lg(G);
-  if (lg.info()!=Eigen::Success) Rcpp::stop("Could not factor G.");
-  MatrixXd Gi=lg.solve(MatrixXd::Identity(p.q,p.q));
+VectorXd compute_beta_hat_cpp(const Eigen::VectorXd& theta, Rcpp::XPtr<PreparedModel> model)
+{
+  PreparedModel& p = *model;
+  if (p.responses.empty()) {
+    Rcpp::stop("Need at least one response.");
+  }
+  const int ro = p.q + p.n_corr;
+  int p_ = 0;
+  int tp = 0;
+  for (const auto& rp : p.responses) {
+    const ResponseModel& r = *rp;
+    tp += r.parameter_count();
+    p_ += r.fixed_effect_dimension();
+  }
+  if (theta.size() != ro + tp) {
+    Rcpp::stop("theta size mismatch.");
+  }
+  for (const auto& rp : p.responses) {
+    ResponseModel& r = *rp;
+    r.update_working_from_theta(theta, p.q, p.n_corr, rp->parameter_offset());
+  }
+  MatrixXd L = build_cholesky(theta, p.q);
+  MatrixXd G = L * L.transpose();
+  G.diagonal().array() += 1e-8;
+  Eigen::LLT<MatrixXd> lg(G);
+  if (lg.info() != Eigen::Success) {
+    Rcpp::stop("Could not factor G.");
+  }
+  MatrixXd Gi = lg.solve(MatrixXd::Identity(p.q, p.q));
   ConditionalContribution contribution(p_);
-  if (!accumulate_conditional_contributions(p,Gi,contribution))
+  if (!accumulate_conditional_contributions(p, Gi, contribution)) {
     Rcpp::stop("Could not accumulate.");
+  }
   bool ok;
-  VectorXd bh=solve_fe(contribution.XtVinvX,contribution.XtVinvy,ok);
+  VectorXd bh = solve_fe(contribution.XtVinvX, contribution.XtVinvy, ok);
   (void)ok;
   return bh;
 }
